@@ -11,6 +11,7 @@
 # NOTE: Reads the same .env keys as your original bot. Keep your secrets safe.
 #
 # Author: adapted for Saleh (VWAP-only)
+# Confluence filter inspired by AlgoAlpha's HMA/pivot order-block approach
 
 import os
 import time
@@ -33,6 +34,9 @@ def now_utc() -> datetime:
 
 def iso_utc_ms() -> str:
     return now_utc().isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+def fmt_signed(x: float) -> str:
+    return f"+{x:.4f}" if x >= 0 else f"-{abs(x):.4f}"
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -155,6 +159,9 @@ def load_settings() -> Dict[str, any]:
     s["OB_ENTRY_TOLERANCE_PCT"] = _f("OB_ENTRY_TOLERANCE_PCT", 0.15)
     s["OB_VOLUME_LOOKBACK"] = _i("OB_VOLUME_LOOKBACK", 20)
     s["OB_VOLUME_MULT"] = _f("OB_VOLUME_MULT", 1.2)
+
+    s["DC_MODE"] = _b("DC_MODE", False)
+    s["DC_LEN"] = _i("DC_LEN", 20)
 
     # Top40 universe and dynamic TP/SL settings
     s["USE_TOP_USDT"] = _b("USE_TOP_USDT", True)
@@ -487,7 +494,7 @@ def anchored_vwap_series(df: pd.DataFrame, start_idx: int) -> pd.Series:
         vwap_masked.iloc[:start_idx] = float('nan')
     return vwap_masked
 
-def vwap_signal(df: pd.DataFrame) -> Dict[str, any]:
+def vwap_signal(df: pd.DataFrame, settings: Dict[str, any]) -> Dict[str, any]:
     highs=df['high']; lows=df['low']; closes=df['close']
     sh, sl = _pivot_indices(highs, lows)
     if len(sh)<2 or len(sl)<2:
@@ -497,21 +504,25 @@ def vwap_signal(df: pd.DataFrame) -> Dict[str, any]:
     last_h, prev_h = sh[-1], sh[-2]
     last_l, prev_l = sl[-1], sl[-2]
 
-    # Simple trend test (higher highs & higher lows vs lower highs & lower lows)
     trend=None
     if highs.iloc[last_h]>highs.iloc[prev_h] and lows.iloc[last_l]>lows.iloc[prev_l]:
         trend='up'
     elif highs.iloc[last_h]<highs.iloc[prev_h] and lows.iloc[last_l]<lows.iloc[prev_l]:
         trend='down'
 
-    # Anchors
-    a_hi_idx = last_h
-    a_lo_idx = last_l
+    dc_mode = bool(settings.get('DC_MODE'))
+    dc_len = int(settings.get('DC_LEN',20))
+    if dc_mode and len(df) >= dc_len:
+        a_hi_idx = len(highs) - dc_len + int(np.argmax(highs.tail(dc_len).values))
+        a_lo_idx = len(lows) - dc_len + int(np.argmin(lows.tail(dc_len).values))
+    else:
+        a_hi_idx = last_h
+        a_lo_idx = last_l
 
-    vwap_hi = anchored_vwap_series(df, a_hi_idx)  # anchored at last swing high
-    vwap_lo = anchored_vwap_series(df, a_lo_idx)  # anchored at last swing low
+    vwap_hi = anchored_vwap_series(df, a_hi_idx)
+    vwap_lo = anchored_vwap_series(df, a_lo_idx)
+    log(f"[VWAP] mode={'donchian' if dc_mode else 'pivots'} a_hi_idx={a_hi_idx} a_lo_idx={a_lo_idx}")
 
-    # Entry logic (continuation breakout of the "opposite" VWAP)
     sig=None
     if trend=='up':
         if len(closes)>=2 and not pd.isna(vwap_hi.iloc[-1]) and not pd.isna(vwap_hi.iloc[-2]):
@@ -667,48 +678,60 @@ class ConfluenceFilter:
         self.zones[inst_key] = zones
         return trend_up, trend_down
 
-    def _allows_df(self, inst_key: str, df: pd.DataFrame, direction: str) -> bool:
+    def _allows_df(self, inst_key: str, df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
         trend_up, trend_down = self._update_zones(inst_key, df)
         price = df['close'].iloc[-1]
         zones = self.zones.get(inst_key, [])
         tol_ratio = self.entry_tol_pct
         if direction == 'buy':
             if not trend_up:
-                return False
+                return False, 'trend_mismatch'
             for z in zones:
                 if z['dir'] != 'bull':
                     continue
                 tol = (z['high'] - z['low']) * tol_ratio
                 if price >= z['low'] - tol and price <= z['high'] + tol:
-                    return True
-            return False
+                    break
+            else:
+                return False, 'not_in_OB_zone dir=bull'
         else:
             if not trend_down:
-                return False
+                return False, 'trend_mismatch'
             for z in zones:
                 if z['dir'] != 'bear':
                     continue
                 tol = (z['high'] - z['low']) * tol_ratio
                 if price <= z['high'] + tol and price >= z['low'] - tol:
-                    return True
-            return False
+                    break
+            else:
+                return False, 'not_in_OB_zone dir=bear'
+
+        avg_vol = df['volume'].tail(self.vol_lookback).mean()
+        last_vol = df['volume'].iloc[-1]
+        if last_vol < avg_vol * self.vol_mult:
+            return False, f"vol {last_vol:.0f} < {self.vol_mult}*avg({avg_vol:.0f})"
+        return True, 'ok'
 
     def allows(self, inst: str, df: pd.DataFrame, direction: str) -> bool:
         if not self.enabled:
             return True
-        if not self._allows_df(inst, df, direction):
+        allowed, reason = self._allows_df(inst, df, direction)
+        if not allowed:
+            log(f"[FILTER] {inst} reject: {reason}")
             return False
-        # Always apply volume/ liquidity filter
-        avg_vol = df['volume'].tail(self.vol_lookback).mean()
-        if df['volume'].iloc[-1] < avg_vol * self.vol_mult:
-            return False
+        htf_flag = ""
         if self.mtf_enabled:
             try:
                 df_htf = get_candles_tf(self.s, inst_id=inst, timeframe=self.mtf_tf, limit=300)
             except Exception:
+                log(f"[FILTER] {inst} reject: htf_fetch_fail")
                 return False
-            if not self._allows_df(inst + "|HTF", df_htf, direction):
+            ok, _ = self._allows_df(inst + "|HTF", df_htf, direction)
+            if not ok:
+                log(f"[FILTER] {inst} reject: htf_mismatch")
                 return False
+            htf_flag = "+HTF"
+        log(f"[FILTER] {inst} allow dir={'buy' if direction=='buy' else 'sell'} (trend+OB+vol{htf_flag})")
         return True
 
 # ---------------------------
@@ -773,7 +796,7 @@ def load_trade_history(path: str):
             rd = csv.DictReader(f)
             for row in rd:
                 try:
-                    pnl=float(row.get("pnl",0))
+                    pnl=float(row.get("pnl_net", row.get("pnl",0)))
                 except: pnl=0.0
                 inst=row.get("instrument","")
                 cum+=pnl; tot+=1; win+=1 if pnl>=0 else 0; loss+=1 if pnl<0 else 0
@@ -831,6 +854,9 @@ def run_bot_vwap_only():
     entry_bar = st.get("entry_bar", 0)
     entry_ordId = st.get("entry_ordId", "")
     fee_entry = st.get("fee_entry", 0.0)
+    entry_fill_px = st.get("entry_fill_px")
+    exec_qty = st.get("exec_qty")
+    initial_stop_dist = st.get("initial_stop_dist", 0.0)
     pm = None
     if current_instrument and position_side and entry_price and entry_size:
         pm = PositionManager(s, position_side, float(entry_price), float(entry_size), float(entry_ct_val or 1), float(stop_price or entry_price), float(tp_price or entry_price), 0.0, entry_time, int(entry_bar))
@@ -871,7 +897,7 @@ def run_bot_vwap_only():
                         log(f"[SKIP] فشل الحصول على البيانات للزوج {inst} ({tf_main}): {ex}")
                         continue
 
-                    sig = vwap_signal(df)
+                    sig = vwap_signal(df, s)
                     trend = sig['trend']
                     vwap_hi = sig['vwap_high']
                     vwap_lo = sig['vwap_low']
@@ -929,12 +955,37 @@ def run_bot_vwap_only():
                         log(f"[ORDER_ERROR] {ex}")
                         continue
 
+                    try:
+                        od = response.get('data', [])[0]
+                        entry_ordId = od.get('ordId', '')
+                        log(f"[ORDER_RESPONSE] code={response.get('code')} sCode={od.get('sCode')} sMsg={od.get('sMsg')} ordId={entry_ordId}")
+                    except Exception:
+                        entry_ordId = ''
+                        log(f"[ORDER_RESPONSE] {response}")
+
+                    fill=None
+                    for _ in range(3):
+                        fill = get_order_fill(s, inst, entry_ordId)
+                        if fill: break
+                        time.sleep(1)
+                    if fill:
+                        entry_fill_px = fill['fillPx']
+                        exec_qty = fill['fillSz']
+                        fee_entry = abs(fill.get('fee', 0.0))
+                    else:
+                        entry_fill_px = price
+                        exec_qty = qty
+                        fee_entry = s['FEE_RATE'] * entry_fill_px * exec_qty * ct
+
                     current_instrument = inst
                     position_side = 'long' if direction=='buy' else 'short'
-                    entry_price = price; entry_size = size_str
-                    entry_ct_val = ct; entry_time = now_utc().isoformat()
+                    entry_price = entry_fill_px
+                    entry_size = size_str
+                    entry_ct_val = ct
+                    entry_time = now_utc().isoformat()
+                    notional = exec_qty * entry_fill_px * ct
+                    margin = notional / s['LEVERAGE']
 
-                    # Fixed TP based on initial stop distance
                     tp_price = (entry_price + stop_dist*rr) if position_side=='long' else (entry_price - stop_dist*rr)
 
                     save_bot_state(state_file, {
@@ -944,14 +995,16 @@ def run_bot_vwap_only():
                         'entry_size': entry_size,
                         'tp_price': tp_price,
                         'entry_ct_val': entry_ct_val,
-                        'entry_time': entry_time
+                        'entry_time': entry_time,
+                        'stop_price': active_stop,
+                        'entry_bar': len(df),
+                        'entry_ordId': entry_ordId,
+                        'entry_fill_px': entry_price,
+                        'exec_qty': exec_qty,
+                        'fee_entry': fee_entry,
+                        'initial_stop_dist': stop_dist
                     })
 
-                    try:
-                        od=response.get('data',[])[0]
-                        log(f"[ORDER_RESPONSE] code={response.get('code')} sCode={od.get('sCode')} sMsg={od.get('sMsg')} ordId={od.get('ordId')}")
-                    except Exception:
-                        log(f"[ORDER_RESPONSE] {response}")
                     try:
                         balance_after = get_account_balance(s,'USDT')
                     except Exception:
@@ -959,14 +1012,15 @@ def run_bot_vwap_only():
 
                     entry_dir = 'شراء' if position_side=='long' else 'بيع'
                     send_telegram(s,
-                        ( "📈" if position_side=='long' else "📉" ) +
+                        ("📈" if position_side=='long' else "📉") +
                         f" دخول صفقة {entry_dir} على <b>{inst}</b>\n"
                         f"TF: {tf_main}\n"
-                        f"القيمة الإسمية: {notional:.2f} | الهامش: {margin:.2f} | الرصيد: {balance_after:.2f}\n"
-                        f"الكمية: {entry_size} | سعر الدخول: {entry_price:.4f}\n"
-                        f"⏫ TP: {tp_price:.4f} | ⏬ وقف متغير: Anchored VWAP ({'low' if position_side=='long' else 'high'})"
+                        f"الكمية: {exec_qty} | سعر الدخول (fill): {entry_price:.4f}\n"
+                        f"الهامش: {margin:.2f} | النوتيونال: {notional:.2f} | الرافعة: {s['LEVERAGE']}x\n"
+                        f"SL (مبدئي/فعّال): {active_stop:.4f} | TP: {tp_price:.4f}\n"
+                        f"ordId: {entry_ordId}"
                     )
-                    log(f"[ENTRY] {entry_dir} {inst}: qty {entry_size}, px {entry_price:.4f}")
+                    log(f"[ENTRY] {entry_dir} {inst}: qty {exec_qty}, px {entry_price:.4f}")
                     opened=True
                     break
 
@@ -982,12 +1036,11 @@ def run_bot_vwap_only():
                     log(f"[ERROR] فشل جلب البيانات للزوج {current_instrument}: {ex}")
                     time.sleep(60); continue
 
-                sig = vwap_signal(df)
+                sig = vwap_signal(df, s)
                 vwap_hi = sig['vwap_high']
                 vwap_lo = sig['vwap_low']
 
                 current_price = df['close'].iloc[-1]
-                # Dynamic stop recalculated each loop
                 if position_side=='long':
                     active_stop = vwap_lo.iloc[-1]
                     tp_hit = current_price >= tp_price if tp_price is not None else False
@@ -997,51 +1050,76 @@ def run_bot_vwap_only():
                     tp_hit = current_price <= tp_price if tp_price is not None else False
                     sl_hit = (not pd.isna(active_stop)) and (current_price >= active_stop)
 
+                log(f"[PM] active_stop={active_stop:.4f} tp={tp_price:.4f} price={current_price:.4f}")
+
                 if tp_hit or sl_hit:
-                    px = current_price
                     closing_side = 'sell' if position_side=='long' else 'buy'
+                    qty_close = float(exec_qty or entry_size)
+                    prec = specs.get(current_instrument, {}).get('szPrec', 0)
+                    size_close = f"{qty_close:.{prec}f}".rstrip('0').rstrip('.')
                     try:
-                        response = place_order(s, side=closing_side, size=entry_size, inst_id=current_instrument, leverage=10, td_mode='cross', ord_type='market')
+                        response = place_order(s, side=closing_side, size=size_close, inst_id=current_instrument, leverage=10, td_mode='cross', ord_type='market')
                     except Exception as ex:
                         log(f"[ORDER_CLOSE_ERROR] {ex}")
                         time.sleep(60); continue
 
+                    try:
+                        od = response.get('data', [])[0]
+                        exit_ordId = od.get('ordId', '')
+                    except Exception:
+                        exit_ordId = ''
+
+                    fill=None
+                    for _ in range(3):
+                        fill = get_order_fill(s, current_instrument, exit_ordId)
+                        if fill: break
+                        time.sleep(1)
+                    if fill:
+                        exit_fill_px = fill['fillPx']
+                        fee_exit = abs(fill.get('fee', 0.0))
+                    else:
+                        exit_fill_px = current_price
+                        fee_exit = s['FEE_RATE'] * exit_fill_px * qty_close * (entry_ct_val or 1.0)
+
                     ct = entry_ct_val if entry_ct_val and entry_ct_val>0 else 1.0
-                    qty = float(entry_size)
-                    gross = (px - entry_price)*qty*ct if position_side=='long' else (entry_price - px)*qty*ct
-                    fee_rate = float(s.get('FEE_RATE',0.0006))
-                    entry_notional = entry_price*qty*ct; exit_notional = px*qty*ct
-                    fees = fee_rate*(entry_notional + exit_notional)
-                    pnl = gross - fees
-                    cum += pnl; tot += 1
-                    if pnl>=0: win += 1
+                    gross = (exit_fill_px - entry_price)*qty_close*ct if position_side=='long' else (entry_price - exit_fill_px)*qty_close*ct
+                    fees = fee_entry + fee_exit
+                    pnl_net = gross - fees
+                    cum += pnl_net; tot += 1
+                    if pnl_net>=0: win += 1
                     else: loss += 1
-                    hour_trades += 1; hour_profit += pnl
-                    if pnl>=0: hour_wins += 1
+                    hour_trades += 1; hour_profit += pnl_net
+                    if pnl_net>=0: hour_wins += 1
                     else: hour_losses += 1
 
                     exit_time = now_utc().isoformat()
-                    reason = "تحقيق الهدف" if tp_hit else "كسر Anchored VWAP (وقف متحرك)"
+                    reason = "TP" if tp_hit else "SL (Anchored VWAP)"
+                    hold_bars = len(df) - int(entry_bar)
+                    hold_sec = int((now_utc() - datetime.fromisoformat(entry_time)).total_seconds()) if entry_time else 0
+                    r_realized = abs((exit_fill_px - entry_price) / initial_stop_dist) if initial_stop_dist>0 else 0.0
+
                     rec = {
                         'timestamp_entry': entry_time, 'timestamp_exit': exit_time,
                         'instrument': current_instrument, 'side': position_side,
-                        'entry_price': entry_price, 'exit_price': px,
-                        'contracts': entry_size, 'ct_val': entry_ct_val,
-                        'gross_pnl': gross, 'fees': fees, 'pnl': pnl
+                        'entry_price': entry_price, 'exit_price': exit_fill_px,
+                        'entry_fill_px': entry_price, 'exit_fill_px': exit_fill_px,
+                        'contracts': qty_close, 'ct_val': entry_ct_val,
+                        'gross_pnl': gross, 'fees': fees, 'pnl_net': pnl_net
                     }
                     append_trade_record(history_file, rec)
                     try:
                         if os.path.isfile(state_file): os.remove(state_file)
                     except Exception: pass
 
-                    profit_text = "ربح" if pnl>=0 else "خسارة"
                     send_telegram(s,
-                        f"✅ إغلاق صفقة {('شراء' if position_side=='long' else 'بيع')} على <b>{current_instrument}</b>\n"
-                        f"سبب الخروج: {reason}\n"
-                        f"سعر الخروج: {px:.4f} USDT\n"
-                        f"نتيجة الصفقة: {profit_text} {abs(pnl):.4f} USDT\n"
-                        f"الإجمالي حتى الآن: {cum:.4f} USDT")
-                    log(f"[EXIT] {('شراء' if position_side=='long' else 'بيع')} {current_instrument}: px {px:.4f}, PnL {pnl:.4f}")
+                        f"✅ إغلاق {('شراء' if position_side=='long' else 'بيع')} <b>{current_instrument}</b> — {reason}\n"
+                        f"سعر الخروج (fill): {exit_fill_px:.4f}\n"
+                        f"PnL: {fmt_signed(pnl_net)} USDT  |  G:{fmt_signed(gross)}  F:{fees:.4f}\n"
+                        f"R-realized: {r_realized:.2f}R  |  مدة الاحتفاظ: {hold_bars} بار / {hold_sec}s\n"
+                        f"ordId(entry): {entry_ordId} | ordId(exit): {exit_ordId}\n"
+                        f"الإجمالي: {cum:.4f} USDT"
+                    )
+                    log(f"[EXIT] {('شراء' if position_side=='long' else 'بيع')} {current_instrument}: px {exit_fill_px:.4f}, PnL {pnl_net:.4f}")
 
                     current_instrument=None; position_side=None
                     entry_price=entry_size=tp_price=entry_ct_val=entry_time=None

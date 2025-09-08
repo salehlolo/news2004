@@ -156,6 +156,23 @@ def load_settings() -> Dict[str, any]:
     s["OB_VOLUME_LOOKBACK"] = _i("OB_VOLUME_LOOKBACK", 20)
     s["OB_VOLUME_MULT"] = _f("OB_VOLUME_MULT", 1.2)
 
+    # Top40 universe and dynamic TP/SL settings
+    s["USE_TOP_USDT"] = _b("USE_TOP_USDT", True)
+    s["TOP_USDT_MODE"] = os.getenv("TOP_USDT_MODE", "override")
+    s["TOP_USDT_COUNT"] = _i("TOP_USDT_COUNT", 40)
+    s["TOP_USDT_SORT"] = os.getenv("TOP_USDT_SORT", "volCcy24h")
+    s["TOP_USDT_MIN_VOL"] = _f("TOP_USDT_MIN_VOL", 1000000)
+    s["ALLOW_QUANTO"] = _b("ALLOW_QUANTO", False)
+
+    s["VWAP_STOP_ATR_MULT"] = _f("VWAP_STOP_ATR_MULT", 0.5)
+    s["MIN_STOP_ATR"] = _f("MIN_STOP_ATR", 0.4)
+    s["MIN_HOLD_BARS"] = _i("MIN_HOLD_BARS", 1)
+    s["BE_TRIGGER_R"] = _f("BE_TRIGGER_R", 1.0)
+    s["PARTIAL_TP_ENABLED"] = _b("PARTIAL_TP_ENABLED", True)
+    s["PARTIAL_TP_PCT"] = _f("PARTIAL_TP_PCT", 0.5)
+    s["PARTIAL_TP_R"] = _f("PARTIAL_TP_R", 1.0)
+    s["COOLDOWN_SEC"] = _i("COOLDOWN_SEC", 120)
+
     return s
 
 def sign_request(secret_key: str, timestamp: str, method: str, request_path: str, body: str) -> str:
@@ -240,6 +257,31 @@ def _precision_from_str(num_str: str) -> int:
         return len(num_str.split('.')[1].rstrip('0'))
     return 0
 
+def calc_atr(df: pd.DataFrame, length: int=14) -> pd.Series:
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(length).mean()
+
+def get_order_fill(settings: Dict[str, any], inst_id: str, ord_id: str) -> Optional[Dict[str, float]]:
+    r = okx_request(settings, "GET", "/api/v5/trade/fills", params={'instId':inst_id,'ordId':ord_id}, private=True)
+    if r.get('code') != '0' or not r.get('data'):
+        return None
+    d = r['data'][0]
+    try:
+        return {
+            'fillPx': float(d.get('fillPx', 0)),
+            'fillSz': float(d.get('fillSz', 0)),
+            'fee': float(d.get('fee', 0))
+        }
+    except Exception:
+        return None
+
 def get_instrument_specs(settings: Dict[str, any], inst_id: str) -> Optional[Dict[str, float]]:
     r = okx_request(settings, "GET", "/api/v5/public/instruments", params={'instType':'SWAP','instId':inst_id})
     if r.get("code")!="0" or not r.get("data"):
@@ -289,6 +331,50 @@ def filter_valid_instruments(settings: Dict[str, any], inst_list: List[str]) -> 
     except Exception as e:
         log(f"[WARN] فشل التحقق من الأزواج: {e}")
         return inst_list
+
+def build_top_usdt_universe(settings: Dict[str, any]) -> Tuple[List[str], Dict[str, Dict[str, float]]]:
+    if not settings.get('USE_TOP_USDT', False):
+        insts = filter_valid_instruments(settings, settings['INSTRUMENT_LIST'])
+        specs = prefetch_instrument_specs(settings, insts)
+        return insts, specs
+    try:
+        r = okx_request(settings, 'GET', '/api/v5/public/instruments', params={'instType':'SWAP'})
+        if r.get('code') != '0':
+            raise RuntimeError(str(r))
+        allowed = []
+        meta = {}
+        for info in r.get('data', []):
+            if info.get('settleCcy') != 'USDT' or info.get('quoteCcy') != 'USDT':
+                continue
+            if not settings.get('ALLOW_QUANTO', False) and info.get('ctType') == 'inverse':
+                continue
+            if info.get('state') != 'live':
+                continue
+            iid = info.get('instId')
+            sp = {
+                'ctVal': float(info.get('ctVal',1)),
+                'lotSz': float(info.get('lotSz',1)),
+                'minSz': float(info.get('minSz',1)),
+                'szPrec': _precision_from_str(info.get('lotSz','1'))
+            }
+            allowed.append(iid)
+            meta[iid] = sp
+        tick = okx_request(settings, 'GET', '/api/v5/market/tickers', params={'instType':'SWAP'})
+        vols = {d['instId']: float(d.get(settings['TOP_USDT_SORT'],0)) for d in tick.get('data',[])}
+        pairs = []
+        for iid in allowed:
+            vol = vols.get(iid,0)
+            if vol >= float(settings['TOP_USDT_MIN_VOL']):
+                pairs.append((iid, vol))
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        top = [p[0] for p in pairs[:settings['TOP_USDT_COUNT']]]
+        log(f"[UNIVERSE] selected {len(top)} instruments")
+        return top, {k:meta[k] for k in top}
+    except Exception as e:
+        log(f"[UNIVERSE_ERROR] {e}; fallback to manual list")
+        insts = filter_valid_instruments(settings, settings['INSTRUMENT_LIST'])
+        specs = prefetch_instrument_specs(settings, insts)
+        return insts, specs
 
 # ---------------------------
 # Data & Signals (VWAP ONLY)
@@ -573,6 +659,42 @@ class ConfluenceFilter:
         return True
 
 # ---------------------------
+# Position Management
+# ---------------------------
+class PositionManager:
+    def __init__(self, settings: Dict[str, any], side: str, entry_price: float,
+                 qty: float, ct_val: float, stop_price: float, tp_price: float,
+                 atr: float, entry_time: str, entry_bar: int):
+        self.s = settings
+        self.side = side
+        self.entry_price = entry_price
+        self.qty = qty
+        self.ct_val = ct_val
+        self.stop_price = stop_price
+        self.tp_price = tp_price
+        self.initial_stop = abs(entry_price - stop_price)
+        self.atr = atr
+        self.entry_time = entry_time
+        self.entry_bar = entry_bar
+        self.entry_ordId = ''
+        self.fee_entry = 0.0
+        self.realized = 0.0
+        self.fees = 0.0
+        self.partial_done = False
+        self.be_moved = False
+
+    def update_stop(self, vwap_hi: float, vwap_lo: float, atr_now: float):
+        mult = self.s['VWAP_STOP_ATR_MULT']
+        if self.side == 'long':
+            self.stop_price = vwap_lo - mult * atr_now
+        else:
+            self.stop_price = vwap_hi + mult * atr_now
+        self.atr = atr_now
+
+    def r_multiple(self, price: float) -> float:
+        return abs(price - self.entry_price) / self.initial_stop if self.initial_stop>0 else 0.0
+
+# ---------------------------
 # Trading
 # ---------------------------
 def place_order(settings: Dict[str, any], side: str, size: str, inst_id: str,
@@ -638,9 +760,8 @@ def run_bot_vwap_only():
     history_file = s["TRADE_HISTORY_FILE"]
     state_file = s["STATE_FILE"]
 
-    instruments = filter_valid_instruments(s, s["INSTRUMENT_LIST"])
+    instruments, specs = build_top_usdt_universe(s)
     tf_list = sorted(parse_timeframes(s["TIMEFRAME"]), key=_tf_to_minutes)
-    # Use a single main TF (highest for stability)
     tf_main = tf_list[-1]
 
     cum, tot, win, loss, inst_stats = load_trade_history(history_file)
@@ -653,6 +774,19 @@ def run_bot_vwap_only():
     tp_price = st.get("tp_price")
     entry_ct_val = st.get("entry_ct_val")
     entry_time = st.get("entry_time")
+    stop_price = st.get("stop_price")
+    entry_bar = st.get("entry_bar", 0)
+    entry_ordId = st.get("entry_ordId", "")
+    fee_entry = st.get("fee_entry", 0.0)
+    pm = None
+    if current_instrument and position_side and entry_price and entry_size:
+        pm = PositionManager(s, position_side, float(entry_price), float(entry_size), float(entry_ct_val or 1), float(stop_price or entry_price), float(tp_price or entry_price), 0.0, entry_time, int(entry_bar))
+        pm.entry_ordId = entry_ordId
+        pm.fee_entry = float(fee_entry)
+        pm.fees = pm.fee_entry
+
+    cooldowns: Dict[str, float] = {}
+    leverage_set: set = set()
 
     start_msg = "🚀 تم تشغيل بوت OKX (استراتيجية VWAP Price Channel فقط)\n" +                 f"الإطار الزمني: {tf_main}\n" +                 f"عدد الأزواج: {len(instruments)}"
     log(start_msg); send_telegram(s, start_msg)
@@ -661,7 +795,6 @@ def run_bot_vwap_only():
     last_report = now_utc()
     hour_trades=0; hour_profit=0.0; hour_wins=0; hour_losses=0
 
-    specs = prefetch_instrument_specs(s, instruments)
     rr = float(s["REWARD_RISK_RATIO"])
     margin_per_trade = float(s.get("MARGIN_PER_TRADE_USDT", 90.0))
     confluence_filter = ConfluenceFilter(s)
@@ -676,6 +809,8 @@ def run_bot_vwap_only():
             if position_side is None:
                 opened=False
                 for inst in instruments:
+                    if inst in cooldowns and time.time() - cooldowns[inst] < s['COOLDOWN_SEC']:
+                        continue
                     # Fetch data
                     try:
                         df = get_candles_tf(s, inst_id=inst, timeframe=tf_main, limit=300)
@@ -700,20 +835,19 @@ def run_bot_vwap_only():
                         continue
                     ct = spec['ctVal']; lot = spec['lotSz']; min_sz = spec['minSz']; prec = spec['szPrec']
 
-                    # Determine active stop (trailing at active anchored VWAP) & initial stop distance
+                    atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
                     if direction=='buy' and trend=='up':
-                        active_stop = vwap_lo.iloc[-1]  # active VWAP is from last swing low
+                        active_stop = vwap_lo.iloc[-1] - s['VWAP_STOP_ATR_MULT']*atr_now
+                        stop_dist = price - active_stop
                     elif direction=='sell' and trend=='down':
-                        active_stop = vwap_hi.iloc[-1]  # active VWAP is from last swing high
+                        active_stop = vwap_hi.iloc[-1] + s['VWAP_STOP_ATR_MULT']*atr_now
+                        stop_dist = active_stop - price
                     else:
-                        # Ignore mixed cases (shouldn't happen with logic above)
                         continue
 
-                    if pd.isna(active_stop):
+                    if pd.isna(active_stop) or stop_dist <= 0:
                         continue
-
-                    stop_dist = abs(price - active_stop)
-                    if stop_dist<=0:
+                    if stop_dist < s['MIN_STOP_ATR']*atr_now:
                         continue
 
                     # Position sizing by fixed margin with precheck

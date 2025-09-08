@@ -388,7 +388,8 @@ def build_top_usdt_universe(settings: Dict[str, any]) -> Tuple[List[str], Dict[s
                 except Exception:
                     v = 0.0
             vols[d['instId']] = v
-        log(f"[UNIVERSE] joined_tickers={len(vols)} missing={len(allowed)-len(vols)}")
+        missing = len([iid for iid in allowed if iid not in vols])
+        log(f"[UNIVERSE] joined_tickers={len(vols)} missing={missing}")
         zeros = sum(1 for iid in allowed if vols.get(iid,0)==0)
         log(f"[UNIVERSE] zeros_metric={zeros} nonzeros_metric={len(allowed)-zeros}")
 
@@ -871,6 +872,7 @@ def run_bot_vwap_only():
 
     start_msg = "🚀 تم تشغيل بوت OKX (استراتيجية VWAP Price Channel فقط)\n" +                 f"الإطار الزمني: {tf_main}\n" +                 f"عدد الأزواج: {len(instruments)}"
     log(start_msg); send_telegram(s, start_msg)
+    log(f"[START] VWAP mode={'donchian' if s['DC_MODE'] else 'pivots'} | OB Filter={'ON' if s['UNIFIED_FILTER_ENABLED'] else 'OFF'}")
     scan_okx(s)
 
     last_report = now_utc()
@@ -1042,17 +1044,33 @@ def run_bot_vwap_only():
                 vwap_hi = sig['vwap_high']
                 vwap_lo = sig['vwap_low']
 
+                atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
+                atr_prev = calc_atr(df, s['OB_ATR_LEN']).iloc[-2]
+                mult = s['VWAP_STOP_ATR_MULT']
                 current_price = df['close'].iloc[-1]
-                if position_side=='long':
-                    active_stop = vwap_lo.iloc[-1]
-                    tp_hit = current_price >= tp_price if tp_price is not None else False
-                    sl_hit = (not pd.isna(active_stop)) and (current_price <= active_stop)
-                else:
-                    active_stop = vwap_hi.iloc[-1]
-                    tp_hit = current_price <= tp_price if tp_price is not None else False
-                    sl_hit = (not pd.isna(active_stop)) and (current_price >= active_stop)
+                close_prev = df['close'].iloc[-2]
+                gap = abs(current_price - close_prev)
 
-                log(f"[PM] active_stop={active_stop:.4f} tp={tp_price:.4f} price={current_price:.4f}")
+                if position_side=='long':
+                    active_stop = vwap_lo.iloc[-1] - mult*atr_now
+                    stop_prev = vwap_lo.iloc[-2] - mult*atr_prev
+                    tp_hit = current_price >= tp_price if tp_price is not None else False
+                    sl_confirm = (current_price < active_stop) and (close_prev >= stop_prev)
+                    gap_exit = gap > atr_now and current_price < active_stop
+                else:
+                    active_stop = vwap_hi.iloc[-1] + mult*atr_now
+                    stop_prev = vwap_hi.iloc[-2] + mult*atr_prev
+                    tp_hit = current_price <= tp_price if tp_price is not None else False
+                    sl_confirm = (current_price > active_stop) and (close_prev <= stop_prev)
+                    gap_exit = gap > atr_now and current_price > active_stop
+
+                hold_bars = len(df) - int(entry_bar or 0)
+                if hold_bars < s['MIN_HOLD_BARS'] and not gap_exit:
+                    sl_confirm = False
+
+                sl_hit = gap_exit or sl_confirm
+
+                log(f"[PM] price={current_price:.4f} atr={atr_now:.4f} stop={active_stop:.4f} tp={tp_price:.4f}")
 
                 if tp_hit or sl_hit:
                     closing_side = 'sell' if position_side=='long' else 'buy'
@@ -1095,18 +1113,33 @@ def run_bot_vwap_only():
                     else: hour_losses += 1
 
                     exit_time = now_utc().isoformat()
-                    reason = "TP" if tp_hit else "SL (Anchored VWAP)"
-                    hold_bars = len(df) - int(entry_bar)
                     hold_sec = int((now_utc() - datetime.fromisoformat(entry_time)).total_seconds()) if entry_time else 0
                     r_realized = abs((exit_fill_px - entry_price) / initial_stop_dist) if initial_stop_dist>0 else 0.0
+                    reason = "TP" if tp_hit else ("SL-gap" if gap_exit else "SL-confirm")
 
                     rec = {
-                        'timestamp_entry': entry_time, 'timestamp_exit': exit_time,
-                        'instrument': current_instrument, 'side': position_side,
-                        'entry_price': entry_price, 'exit_price': exit_fill_px,
-                        'entry_fill_px': entry_price, 'exit_fill_px': exit_fill_px,
-                        'contracts': qty_close, 'ct_val': entry_ct_val,
-                        'gross_pnl': gross, 'fees': fees, 'pnl_net': pnl_net
+                        'timestamp_entry': entry_time,
+                        'timestamp_exit': exit_time,
+                        'tf': tf_main,
+                        'instrument': current_instrument,
+                        'side': position_side,
+                        'entry_ordId': entry_ordId,
+                        'exit_ordId': exit_ordId,
+                        'entry_fill_px': entry_price,
+                        'exit_fill_px': exit_fill_px,
+                        'exec_qty': qty_close,
+                        'ct_val': entry_ct_val,
+                        'initial_stop': initial_stop_dist,
+                        'exit_reason': reason,
+                        'gross_pnl': gross,
+                        'fees': fees,
+                        'pnl_net': pnl_net,
+                        'r_realized': r_realized,
+                        'hold_bars': hold_bars,
+                        'hold_time_sec': hold_sec,
+                        'notional_entry': entry_price * qty_close * (entry_ct_val or 1.0),
+                        'notional_exit': exit_fill_px * qty_close * (entry_ct_val or 1.0),
+                        'leverage': s['LEVERAGE'],
                     }
                     append_trade_record(history_file, rec)
                     try:
@@ -1116,6 +1149,7 @@ def run_bot_vwap_only():
                     send_telegram(s,
                         f"✅ إغلاق {('شراء' if position_side=='long' else 'بيع')} <b>{current_instrument}</b> — {reason}\n"
                         f"سعر الخروج (fill): {exit_fill_px:.4f}\n"
+                        f"SL/TP عند الخروج: SL={active_stop:.4f} | TP={tp_price:.4f}\n"
                         f"PnL: {fmt_signed(pnl_net)} USDT  |  G:{fmt_signed(gross)}  F:{fees:.4f}\n"
                         f"R-realized: {r_realized:.2f}R  |  مدة الاحتفاظ: {hold_bars} بار / {hold_sec}s\n"
                         f"ordId(entry): {entry_ordId} | ordId(exit): {exit_ordId}\n"

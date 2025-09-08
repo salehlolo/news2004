@@ -163,6 +163,8 @@ def load_settings() -> Dict[str, any]:
     s["TOP_USDT_SORT"] = os.getenv("TOP_USDT_SORT", "volCcy24h")
     s["TOP_USDT_MIN_VOL"] = _f("TOP_USDT_MIN_VOL", 1000000)
     s["ALLOW_QUANTO"] = _b("ALLOW_QUANTO", False)
+    s["UNIVERSE_MIN_COUNT"] = _i("UNIVERSE_MIN_COUNT", 8)
+    s["UNIVERSE_ENABLE_FALLBACK"] = _b("UNIVERSE_ENABLE_FALLBACK", True)
 
     s["VWAP_STOP_ATR_MULT"] = _f("VWAP_STOP_ATR_MULT", 0.5)
     s["MIN_STOP_ATR"] = _f("MIN_STOP_ATR", 0.4)
@@ -337,18 +339,20 @@ def build_top_usdt_universe(settings: Dict[str, any]) -> Tuple[List[str], Dict[s
         insts = filter_valid_instruments(settings, settings['INSTRUMENT_LIST'])
         specs = prefetch_instrument_specs(settings, insts)
         return insts, specs
+    log(f"[UNIVERSE] env={settings.get('ENVIRONMENT')} mode={settings.get('TOP_USDT_MODE')}")
     try:
         r = okx_request(settings, 'GET', '/api/v5/public/instruments', params={'instType':'SWAP'})
         if r.get('code') != '0':
             raise RuntimeError(str(r))
-        allowed = []
-        meta = {}
+        allowed: List[str] = []
+        meta: Dict[str, Dict[str, float]] = {}
         for info in r.get('data', []):
-            if info.get('settleCcy') != 'USDT' or info.get('quoteCcy') != 'USDT':
+            if info.get('settleCcy') != 'USDT':
                 continue
             if not settings.get('ALLOW_QUANTO', False) and info.get('ctType') == 'inverse':
                 continue
-            if info.get('state') != 'live':
+            state = (info.get('state') or '').lower()
+            if state in ('suspend', 'delisted', 'offline'):
                 continue
             iid = info.get('instId')
             sp = {
@@ -359,17 +363,66 @@ def build_top_usdt_universe(settings: Dict[str, any]) -> Tuple[List[str], Dict[s
             }
             allowed.append(iid)
             meta[iid] = sp
+        log(f"[UNIVERSE] prefilter_total={len(allowed)}")
+
         tick = okx_request(settings, 'GET', '/api/v5/market/tickers', params={'instType':'SWAP'})
-        vols = {d['instId']: float(d.get(settings['TOP_USDT_SORT'],0)) for d in tick.get('data',[])}
+        vols: Dict[str, float] = {}
+        for d in tick.get('data', []):
+            val = d.get(settings['TOP_USDT_SORT'])
+            try:
+                v = float(val) if val not in (None, '') else 0.0
+            except Exception:
+                v = 0.0
+            if v == 0.0:
+                v24 = d.get('vol24h')
+                last = d.get('last')
+                try:
+                    v = float(v24 or 0) * float(last or 0)
+                except Exception:
+                    v = 0.0
+            vols[d['instId']] = v
+        log(f"[UNIVERSE] joined_tickers={len(vols)} missing={len(allowed)-len(vols)}")
+        zeros = sum(1 for iid in allowed if vols.get(iid,0)==0)
+        log(f"[UNIVERSE] zeros_metric={zeros} nonzeros_metric={len(allowed)-zeros}")
+
         pairs = []
+        min_vol = float(settings.get('TOP_USDT_MIN_VOL',0))
+        env = str(settings.get('ENVIRONMENT','')).lower()
         for iid in allowed:
-            vol = vols.get(iid,0)
-            if vol >= float(settings['TOP_USDT_MIN_VOL']):
+            vol = vols.get(iid,0.0)
+            if vol >= min_vol or (vol==0.0 and env=='demo' and min_vol==0):
                 pairs.append((iid, vol))
+        log(f"[UNIVERSE] after_filters={len(pairs)} taking_top={settings['TOP_USDT_COUNT']}")
         pairs.sort(key=lambda x: x[1], reverse=True)
         top = [p[0] for p in pairs[:settings['TOP_USDT_COUNT']]]
+
+        if (not top) or (len(top) < settings.get('UNIVERSE_MIN_COUNT', 8)):
+            manual = filter_valid_instruments(settings, settings['INSTRUMENT_LIST'])
+            if settings.get('TOP_USDT_MODE','override') == 'merge':
+                merged = list(dict.fromkeys(top + manual))
+                top = merged
+            if (not top) and settings.get('UNIVERSE_ENABLE_FALLBACK', True):
+                default = ['BTC-USDT-SWAP','ETH-USDT-SWAP','SOL-USDT-SWAP','XRP-USDT-SWAP',
+                           'BNB-USDT-SWAP','DOGE-USDT-SWAP','TRX-USDT-SWAP','TON-USDT-SWAP']
+                default = filter_valid_instruments(settings, default)
+                top = default[:max(settings.get('UNIVERSE_MIN_COUNT',8), len(default))]
+            log(f"[UNIVERSE][FALLBACK] using {len(top)} instruments")
+
+        examples = ', '.join([f"{iid}={vols.get(iid,0):.2f}" for iid in top[:3]])
         log(f"[UNIVERSE] selected {len(top)} instruments")
-        return top, {k:meta[k] for k in top}
+        if examples:
+            log(f"[UNIVERSE] examples: {examples}")
+
+        specs: Dict[str, Dict[str, float]] = {}
+        missing: List[str] = []
+        for iid in top:
+            if iid in meta:
+                specs[iid] = meta[iid]
+            else:
+                missing.append(iid)
+        if missing:
+            specs.update(prefetch_instrument_specs(settings, missing))
+        return top, specs
     except Exception as e:
         log(f"[UNIVERSE_ERROR] {e}; fallback to manual list")
         insts = filter_valid_instruments(settings, settings['INSTRUMENT_LIST'])

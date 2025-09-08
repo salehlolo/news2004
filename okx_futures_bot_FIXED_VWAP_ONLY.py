@@ -250,6 +250,24 @@ def prefetch_instrument_specs(settings: Dict[str, any], inst_list: List[str]) ->
     except Exception:
         return spec
 
+def filter_valid_instruments(settings: Dict[str, any], inst_list: List[str]) -> List[str]:
+    """Remove instruments that are not recognised by OKX to avoid 51001 errors."""
+    try:
+        r = okx_request(settings, "GET", "/api/v5/public/instruments", params={'instType': 'SWAP'})
+        if r.get("code") != "0":
+            return inst_list
+        valid = {d.get("instId") for d in r.get("data", [])}
+        out = []
+        for inst in inst_list:
+            if inst in valid:
+                out.append(inst)
+            else:
+                log(f"[WARN] تجاهل الزوج غير المعروف {inst}")
+        return out or inst_list
+    except Exception as e:
+        log(f"[WARN] فشل التحقق من الأزواج: {e}")
+        return inst_list
+
 # ---------------------------
 # Data & Signals (VWAP ONLY)
 # ---------------------------
@@ -598,7 +616,7 @@ def run_bot_vwap_only():
     history_file = s["TRADE_HISTORY_FILE"]
     state_file = s["STATE_FILE"]
 
-    instruments = s["INSTRUMENT_LIST"]
+    instruments = filter_valid_instruments(s, s["INSTRUMENT_LIST"])
     tf_list = sorted(parse_timeframes(s["TIMEFRAME"]), key=_tf_to_minutes)
     # Use a single main TF (highest for stability)
     tf_main = tf_list[-1]

@@ -90,7 +90,7 @@ def load_settings() -> Dict[str, any]:
     s["TIMEFRAME"] = os.getenv("TIMEFRAME","30m")
     s["BASE_URL"] = os.getenv("OKX_BASE_URL","https://www.okx.com")
 
-    # Risk/fees
+    # Fees and fixed margin per trade
     def _f(name, default):
         val = os.getenv(name)
         try:
@@ -98,10 +98,8 @@ def load_settings() -> Dict[str, any]:
         except Exception:
             return default
     s["FEE_RATE"] = _f("FEE_RATE", 0.0006)
-    s["RISK_PER_TRADE_PCT"] = _f("RISK_PER_TRADE_PCT", 0.01)
-    s["DAILY_RISK_PCT"] = _f("DAILY_RISK_PCT", 0.0)  # 0 disables daily stop
     s["REWARD_RISK_RATIO"] = _f("REWARD_RISK_RATIO", 5.0)
-    s["FIXED_CAPITAL_USDT"] = _f("FIXED_CAPITAL_USDT", 0.0)  # if >0, sizing uses this base capital instead of balance
+    s["MARGIN_PER_TRADE_USDT"] = _f("MARGIN_PER_TRADE_USDT", 90.0)
 
     # Files
     s["DATA_DIR"] = os.getenv("DATA_DIR",".")
@@ -153,6 +151,17 @@ def send_telegram(settings: Dict[str, any], message: str) -> None:
         requests.post(url, data=payload, timeout=10)
     except Exception as e:
         log(f"[Telegram] send failed: {e}")
+
+
+def scan_okx(settings: Dict[str, any]) -> None:
+    """Simple connectivity check to ensure the script runs."""
+    try:
+        r = okx_request(settings, "GET", "/api/v5/public/time")
+        ts = r.get("data", [{}])[0].get("ts", "?")
+        log(f"[SCAN] OKX server time: {ts}")
+    except Exception as e:
+        log(f"[SCAN_ERROR] {e}")
+        send_telegram(settings, f"⚠️ فشل الفحص: {e}")
 
 # ---------------------------
 # Exchange Helpers
@@ -396,38 +405,21 @@ def run_bot_vwap_only():
 
     start_msg = "🚀 تم تشغيل بوت OKX (استراتيجية VWAP Price Channel فقط)\n" +                 f"الإطار الزمني: {tf_main}\n" +                 f"عدد الأزواج: {len(instruments)}"
     log(start_msg); send_telegram(s, start_msg)
+    scan_okx(s)
 
     last_report = now_utc()
     hour_trades=0; hour_profit=0.0; hour_wins=0; hour_losses=0
 
     specs = prefetch_instrument_specs(s, instruments)
-    risk = float(s["RISK_PER_TRADE_PCT"])
-    daily_risk_pct = float(s["DAILY_RISK_PCT"])
     rr = float(s["REWARD_RISK_RATIO"])
-    fixed_capital = float(s.get("FIXED_CAPITAL_USDT", 0.0))
-
-    last_day = now_utc().date()
-    daily_loss = 0.0
+    margin_per_trade = float(s.get("MARGIN_PER_TRADE_USDT", 90.0))
 
     while True:
         try:
-            # Daily reset
-            today = now_utc().date()
-            if today != last_day:
-                daily_loss=0.0; last_day=today
-
-            # Check daily stop
             try:
                 bal = get_account_balance(s, 'USDT')
             except Exception:
                 bal = 0.0
-            if daily_risk_pct>0 and daily_loss >= bal*daily_risk_pct:
-                log("[DAILY LIMIT] تم الوصول إلى حد الخسارة اليومي")
-                send_telegram(s,"⚠️ تم الوصول إلى حد الخسارة اليومي")
-                time.sleep(60); continue
-
-            # Base capital for sizing: fixed (if >0) else balance
-            base_capital = fixed_capital if fixed_capital>0 else bal
 
             if position_side is None:
                 opened=False
@@ -466,16 +458,16 @@ def run_bot_vwap_only():
                     if stop_dist<=0:
                         continue
 
-                    # Position sizing by risk
-                    risk_amount = base_capital * risk
-                    contracts_raw = risk_amount / (stop_dist * ct)
+                    # Position sizing by fixed margin
+                    lev = 10
+                    notional_target = margin_per_trade * lev
                     lot = lot if lot and lot>0 else 1.0
+                    contracts_raw = notional_target / (price * ct)
                     units_int = max(1, int(contracts_raw / lot))
                     contracts = units_int * lot
                     size_str = f"{contracts:.8f}".rstrip('0').rstrip('.')
                     notional = price * contracts * ct
-                    lev=10
-                    margin = notional/lev
+                    margin = notional / lev
 
                     # Place entry
                     side = 'buy' if direction=='buy' else 'sell'
@@ -571,7 +563,7 @@ def run_bot_vwap_only():
                     pnl = gross - fees
                     cum += pnl; tot += 1
                     if pnl>=0: win += 1
-                    else: loss += 1; daily_loss += -pnl
+                    else: loss += 1
                     hour_trades += 1; hour_profit += pnl
                     if pnl>=0: hour_wins += 1
                     else: hour_losses += 1

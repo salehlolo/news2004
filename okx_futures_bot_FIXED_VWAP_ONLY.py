@@ -396,6 +396,8 @@ def build_top_usdt_universe(settings: Dict[str, any]) -> Tuple[List[str], Dict[s
         min_vol = float(settings.get('TOP_USDT_MIN_VOL',0))
         env = str(settings.get('ENVIRONMENT','')).lower()
         for iid in allowed:
+            if iid not in vols:
+                continue  # missing ticker data often indicates demo-inaccessible instrument (51001)
             vol = vols.get(iid,0.0)
             if vol >= min_vol or (vol==0.0 and env=='demo' and min_vol==0):
                 pairs.append((iid, vol))

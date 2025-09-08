@@ -111,7 +111,7 @@ def load_settings() -> Dict[str, any]:
     # Reporting
     s["VERBOSE"] = int(os.getenv("VERBOSE","1") or "1")
 
-    # Order Block filter settings
+    # Confluence filter settings (Trend + Order Block + Volume)
     def _i(name, default):
         val = os.getenv(name)
         try:
@@ -124,7 +124,7 @@ def load_settings() -> Dict[str, any]:
             return default
         return str(val).lower() in ("1","true","yes","on")
 
-    s["OB_FILTER_ENABLED"] = _b("OB_FILTER_ENABLED", False)
+    s["UNIFIED_FILTER_ENABLED"] = _b("UNIFIED_FILTER_ENABLED", False)
     s["OB_TREND_MA_TYPE"] = os.getenv("OB_TREND_MA_TYPE", "HMA")
     s["OB_TREND_MA_LEN"] = _i("OB_TREND_MA_LEN", 55)
     s["OB_PIVOT_LEFT"] = _i("OB_PIVOT_LEFT", 3)
@@ -136,9 +136,7 @@ def load_settings() -> Dict[str, any]:
     s["OB_ATR_LEN"] = _i("OB_ATR_LEN", 14)
     s["OB_MTF_ENABLED"] = _b("OB_MTF_ENABLED", False)
     s["OB_MTF_TIMEFRAME"] = os.getenv("OB_MTF_TIMEFRAME", "1h")
-    s["OB_REQUIRE_CONFLUENCE"] = _b("OB_REQUIRE_CONFLUENCE", True)
     s["OB_ENTRY_TOLERANCE_PCT"] = _f("OB_ENTRY_TOLERANCE_PCT", 0.15)
-    s["OB_VOLUME_FILTER"] = _b("OB_VOLUME_FILTER", False)
     s["OB_VOLUME_LOOKBACK"] = _i("OB_VOLUME_LOOKBACK", 20)
     s["OB_VOLUME_MULT"] = _f("OB_VOLUME_MULT", 1.2)
 
@@ -357,10 +355,13 @@ def vwap_signal(df: pd.DataFrame) -> Dict[str, any]:
 # ---------------------------
 # Order Block Filter
 # ---------------------------
-class OBFilter:
+class ConfluenceFilter:
+    """Trend + Order Block + Volume filter sitting atop VWAP logic."""
+
     def __init__(self, settings: Dict[str, any]):
         self.s = settings
-        self.enabled = bool(settings.get("OB_FILTER_ENABLED"))
+        # Unified filter enable switch
+        self.enabled = bool(settings.get("UNIFIED_FILTER_ENABLED"))
         self.ma_type = str(settings.get("OB_TREND_MA_TYPE", "HMA")).upper()
         self.ma_len = int(settings.get("OB_TREND_MA_LEN", 55))
         self.pivot_left = int(settings.get("OB_PIVOT_LEFT", 3))
@@ -372,7 +373,6 @@ class OBFilter:
         self.mtf_enabled = bool(settings.get("OB_MTF_ENABLED"))
         self.mtf_tf = settings.get("OB_MTF_TIMEFRAME", "1h")
         self.entry_tol_pct = float(settings.get("OB_ENTRY_TOLERANCE_PCT", 0.15)) / 100.0
-        self.volume_filter = bool(settings.get("OB_VOLUME_FILTER"))
         self.vol_lookback = int(settings.get("OB_VOLUME_LOOKBACK", 20))
         self.vol_mult = float(settings.get("OB_VOLUME_MULT", 1.2))
         self.zones: Dict[str, List[Dict]] = {}
@@ -519,10 +519,10 @@ class OBFilter:
             return True
         if not self._allows_df(inst, df, direction):
             return False
-        if self.volume_filter:
-            avg_vol = df['volume'].tail(self.vol_lookback).mean()
-            if df['volume'].iloc[-1] < avg_vol * self.vol_mult:
-                return False
+        # Always apply volume/ liquidity filter
+        avg_vol = df['volume'].tail(self.vol_lookback).mean()
+        if df['volume'].iloc[-1] < avg_vol * self.vol_mult:
+            return False
         if self.mtf_enabled:
             try:
                 df_htf = get_candles_tf(self.s, inst_id=inst, timeframe=self.mtf_tf, limit=300)
@@ -624,7 +624,7 @@ def run_bot_vwap_only():
     specs = prefetch_instrument_specs(s, instruments)
     rr = float(s["REWARD_RISK_RATIO"])
     margin_per_trade = float(s.get("MARGIN_PER_TRADE_USDT", 90.0))
-    ob_filter = OBFilter(s)
+    confluence_filter = ConfluenceFilter(s)
 
     while True:
         try:
@@ -651,7 +651,7 @@ def run_bot_vwap_only():
                     if direction is None or trend is None:
                         continue
 
-                    if not ob_filter.allows(inst, df, direction):
+                    if not confluence_filter.allows(inst, df, direction):
                         continue
 
                     price = df['close'].iloc[-1]

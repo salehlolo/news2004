@@ -99,9 +99,25 @@ def load_settings() -> Dict[str, any]:
             return float(val) if val is not None else default
         except Exception:
             return default
+    def _i(name, default):
+        val = os.getenv(name)
+        try:
+            return int(val) if val is not None else default
+        except Exception:
+            return default
+    def _b(name, default=False):
+        val = os.getenv(name)
+        if val is None:
+            return default
+        return str(val).lower() in ("1","true","on","yes")
+
     s["FEE_RATE"] = _f("FEE_RATE", 0.0006)
     s["REWARD_RISK_RATIO"] = _f("REWARD_RISK_RATIO", 5.0)
     s["MARGIN_PER_TRADE_USDT"] = _f("MARGIN_PER_TRADE_USDT", 90.0)
+    s["LEVERAGE"] = _i("LEVERAGE", 10)
+    s["AUTO_ADJUST_MARGIN"] = _b("AUTO_ADJUST_MARGIN", True)
+    s["MIN_MARGIN_PER_TRADE_USDT"] = _f("MIN_MARGIN_PER_TRADE_USDT", 15.0)
+    s["ENVIRONMENT"] = os.getenv("ENVIRONMENT","demo")
 
     # Files
     s["DATA_DIR"] = os.getenv("DATA_DIR",".")
@@ -149,7 +165,9 @@ def sign_request(secret_key: str, timestamp: str, method: str, request_path: str
 
 def okx_request(settings: Dict[str, any], method: str, path: str, params: Optional[Dict]=None, body: Optional[Dict]=None, private: bool=False) -> Dict:
     url = settings["BASE_URL"] + path
-    headers = {'Content-Type': 'application/json', 'x-simulated-trading': '1'}
+    headers = {'Content-Type': 'application/json'}
+    env = str(settings.get("ENVIRONMENT", "demo")).lower()
+    headers['x-simulated-trading'] = '1' if env == 'demo' else '0'
     if private:
         ts = iso_utc_ms()
         body_str = json.dumps(body) if body else ''
@@ -213,41 +231,45 @@ def get_last_price(settings: Dict[str, any], inst_id: str) -> float:
         raise RuntimeError(f"ticker error: {r}")
     return float(r["data"][0]["last"])
 
-def get_instrument_specs(settings: Dict[str, any], inst_id: str) -> Tuple[float,float]:
+def _precision_from_str(num_str: str) -> int:
+    if num_str is None:
+        return 0
+    if isinstance(num_str, (int, float)):
+        num_str = str(num_str)
+    if '.' in num_str:
+        return len(num_str.split('.')[1].rstrip('0'))
+    return 0
+
+def get_instrument_specs(settings: Dict[str, any], inst_id: str) -> Optional[Dict[str, float]]:
     r = okx_request(settings, "GET", "/api/v5/public/instruments", params={'instType':'SWAP','instId':inst_id})
     if r.get("code")!="0" or not r.get("data"):
-        return (1.0, 1.0)
+        return None
     info = r["data"][0]
-    lot = info.get("lotSz") or info.get("lotSize") or info.get("minSz")
-    ct = info.get("ctVal")
     try:
-        lot_f = float(lot) if lot is not None else 1.0
+        ct = float(info["ctVal"])
+        lot = float(info["lotSz"])
+        min_sz = float(info["minSz"])
+        prec = _precision_from_str(info["lotSz"])
+        return {"ctVal": ct, "lotSz": lot, "minSz": min_sz, "szPrec": prec}
     except Exception:
-        lot_f = 1.0
-    try:
-        ct_f = float(ct) if ct is not None else 1.0
-    except Exception:
-        ct_f = 1.0
-    return (lot_f, ct_f)
+        log(f"[SPEC_ERROR] {inst_id} -> {info}")
+        return None
 
-def prefetch_instrument_specs(settings: Dict[str, any], inst_list: List[str]) -> Dict[str, Tuple[float,float]]:
-    spec = {i:(1.0,1.0) for i in inst_list}
+def prefetch_instrument_specs(settings: Dict[str, any], inst_list: List[str]) -> Dict[str, Dict[str, float]]:
+    spec: Dict[str, Dict[str, float]] = {}
     try:
         r = okx_request(settings, "GET", "/api/v5/public/instruments", params={'instType':'SWAP'})
         if r.get("code")!="0":
             return spec
         for info in r.get("data",[]):
             iid = info.get("instId")
-            if iid in spec:
-                lot = info.get("lotSz") or info.get("lotSize") or info.get("minSz")
-                ct = info.get("ctVal")
-                try: lot_f = float(lot) if lot is not None else 1.0
-                except: lot_f = 1.0
-                try: ct_f = float(ct) if ct is not None else 1.0
-                except: ct_f = 1.0
-                spec[iid] = (lot_f, ct_f)
+            if iid in inst_list:
+                sp = get_instrument_specs(settings, iid)
+                if sp:
+                    spec[iid] = sp
         return spec
-    except Exception:
+    except Exception as e:
+        log(f"[SPEC_FETCH_ERROR] {e}")
         return spec
 
 def filter_valid_instruments(settings: Dict[str, any], inst_list: List[str]) -> List[str]:
@@ -673,7 +695,10 @@ def run_bot_vwap_only():
                         continue
 
                     price = df['close'].iloc[-1]
-                    lot, ct = specs.get(inst,(1.0,1.0))
+                    spec = specs.get(inst)
+                    if not spec:
+                        continue
+                    ct = spec['ctVal']; lot = spec['lotSz']; min_sz = spec['minSz']; prec = spec['szPrec']
 
                     # Determine active stop (trailing at active anchored VWAP) & initial stop distance
                     if direction=='buy' and trend=='up':
@@ -691,21 +716,28 @@ def run_bot_vwap_only():
                     if stop_dist<=0:
                         continue
 
-                    # Position sizing by fixed margin
-                    lev = 10
-                    notional_target = margin_per_trade * lev
-                    lot = lot if lot and lot>0 else 1.0
+                    # Position sizing by fixed margin with precheck
+                    notional_target = margin_per_trade * s["LEVERAGE"]
                     contracts_raw = notional_target / (price * ct)
-                    units_int = max(1, int(contracts_raw / lot))
-                    contracts = units_int * lot
-                    size_str = f"{contracts:.8f}".rstrip('0').rstrip('.')
-                    notional = price * contracts * ct
-                    margin = notional / lev
+                    qty = math.floor(contracts_raw / lot) * lot
+                    if qty < min_sz:
+                        if s["AUTO_ADJUST_MARGIN"]:
+                            qty = min_sz
+                        else:
+                            continue
+                    notional = qty * price * ct
+                    fee_buffer = notional * s["FEE_RATE"] * 2
+                    required_margin = notional / s["LEVERAGE"] + fee_buffer
+                    log(f"[SIZING] price={price:.4f} ctVal={ct} lotSz={lot} minSz={min_sz} contracts_raw={contracts_raw:.4f} qty_final={qty}")
+                    if bal < required_margin:
+                        log(f"[PRECHECK_FAIL] avail={bal:.2f} required={required_margin:.2f} notional={notional:.2f} qty={qty} leverage={s['LEVERAGE']}")
+                        continue
+                    size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
+                    margin = notional / s["LEVERAGE"]
 
-                    # Place entry
                     side = 'buy' if direction=='buy' else 'sell'
                     try:
-                        response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=lev, td_mode='cross', ord_type='market')
+                        response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=s['LEVERAGE'], td_mode='cross', ord_type='market')
                     except Exception as ex:
                         log(f"[ORDER_ERROR] {ex}")
                         continue

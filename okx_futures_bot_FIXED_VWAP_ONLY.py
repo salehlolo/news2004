@@ -22,6 +22,8 @@ from typing import Dict, Optional, Tuple, List
 
 import requests
 import pandas as pd
+import numpy as np
+import math
 
 def log(message: str) -> None:
     print(message, flush=True)
@@ -108,6 +110,37 @@ def load_settings() -> Dict[str, any]:
 
     # Reporting
     s["VERBOSE"] = int(os.getenv("VERBOSE","1") or "1")
+
+    # Order Block filter settings
+    def _i(name, default):
+        val = os.getenv(name)
+        try:
+            return int(val) if val is not None else default
+        except Exception:
+            return default
+    def _b(name, default=False):
+        val = os.getenv(name)
+        if val is None:
+            return default
+        return str(val).lower() in ("1","true","yes","on")
+
+    s["OB_FILTER_ENABLED"] = _b("OB_FILTER_ENABLED", False)
+    s["OB_TREND_MA_TYPE"] = os.getenv("OB_TREND_MA_TYPE", "HMA")
+    s["OB_TREND_MA_LEN"] = _i("OB_TREND_MA_LEN", 55)
+    s["OB_PIVOT_LEFT"] = _i("OB_PIVOT_LEFT", 3)
+    s["OB_PIVOT_RIGHT"] = _i("OB_PIVOT_RIGHT", 3)
+    s["OB_LOOKBACK"] = _i("OB_LOOKBACK", 300)
+    s["OB_ZONE_EXTEND_BARS"] = _i("OB_ZONE_EXTEND_BARS", 500)
+    s["OB_INVALIDATION_MODE"] = os.getenv("OB_INVALIDATION_MODE", "CLOSE_THROUGH")
+    s["OB_MIN_ZONE_SIZE_MULT"] = _f("OB_MIN_ZONE_SIZE_MULT", 0.25)
+    s["OB_ATR_LEN"] = _i("OB_ATR_LEN", 14)
+    s["OB_MTF_ENABLED"] = _b("OB_MTF_ENABLED", False)
+    s["OB_MTF_TIMEFRAME"] = os.getenv("OB_MTF_TIMEFRAME", "1h")
+    s["OB_REQUIRE_CONFLUENCE"] = _b("OB_REQUIRE_CONFLUENCE", True)
+    s["OB_ENTRY_TOLERANCE_PCT"] = _f("OB_ENTRY_TOLERANCE_PCT", 0.15)
+    s["OB_VOLUME_FILTER"] = _b("OB_VOLUME_FILTER", False)
+    s["OB_VOLUME_LOOKBACK"] = _i("OB_VOLUME_LOOKBACK", 20)
+    s["OB_VOLUME_MULT"] = _f("OB_VOLUME_MULT", 1.2)
 
     return s
 
@@ -322,6 +355,184 @@ def vwap_signal(df: pd.DataFrame) -> Dict[str, any]:
     }
 
 # ---------------------------
+# Order Block Filter
+# ---------------------------
+class OBFilter:
+    def __init__(self, settings: Dict[str, any]):
+        self.s = settings
+        self.enabled = bool(settings.get("OB_FILTER_ENABLED"))
+        self.ma_type = str(settings.get("OB_TREND_MA_TYPE", "HMA")).upper()
+        self.ma_len = int(settings.get("OB_TREND_MA_LEN", 55))
+        self.pivot_left = int(settings.get("OB_PIVOT_LEFT", 3))
+        self.pivot_right = int(settings.get("OB_PIVOT_RIGHT", 3))
+        self.lookback = int(settings.get("OB_LOOKBACK", 300))
+        self.zone_extend = int(settings.get("OB_ZONE_EXTEND_BARS", 500))
+        self.min_zone_mult = float(settings.get("OB_MIN_ZONE_SIZE_MULT", 0.25))
+        self.atr_len = int(settings.get("OB_ATR_LEN", 14))
+        self.mtf_enabled = bool(settings.get("OB_MTF_ENABLED"))
+        self.mtf_tf = settings.get("OB_MTF_TIMEFRAME", "1h")
+        self.entry_tol_pct = float(settings.get("OB_ENTRY_TOLERANCE_PCT", 0.15)) / 100.0
+        self.volume_filter = bool(settings.get("OB_VOLUME_FILTER"))
+        self.vol_lookback = int(settings.get("OB_VOLUME_LOOKBACK", 20))
+        self.vol_mult = float(settings.get("OB_VOLUME_MULT", 1.2))
+        self.zones: Dict[str, List[Dict]] = {}
+
+    # --- helpers ---
+    def _wma(self, series: pd.Series, length: int) -> pd.Series:
+        weights = np.arange(1, length + 1)
+        return series.rolling(length).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+    def _ma(self, series: pd.Series) -> pd.Series:
+        t = self.ma_type
+        l = self.ma_len
+        if t == "EMA":
+            return series.ewm(span=l, adjust=False).mean()
+        if t == "SMA":
+            return series.rolling(l).mean()
+        # default HMA
+        half = l // 2
+        sqrt_l = int(math.sqrt(l)) or 1
+        return self._wma(2 * self._wma(series, half) - self._wma(series, l), sqrt_l)
+
+    def _atr(self, df: pd.DataFrame) -> pd.Series:
+        high = df['high']; low = df['low']; close = df['close']
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
+        return tr.rolling(self.atr_len).mean()
+
+    def _pivot_highs(self, series: pd.Series) -> List[int]:
+        left = self.pivot_left; right = self.pivot_right
+        ph = []
+        for i in range(left, len(series) - right):
+            window = series.iloc[i - left:i + right + 1]
+            if series.iloc[i] == window.max():
+                ph.append(i)
+        return ph
+
+    def _pivot_lows(self, series: pd.Series) -> List[int]:
+        left = self.pivot_left; right = self.pivot_right
+        pl = []
+        for i in range(left, len(series) - right):
+            window = series.iloc[i - left:i + right + 1]
+            if series.iloc[i] == window.min():
+                pl.append(i)
+        return pl
+
+    def _update_zones(self, inst_key: str, df: pd.DataFrame) -> Tuple[bool, bool]:
+        zones = self.zones.setdefault(inst_key, [])
+        close = df['close']; open_ = df['open']; high = df['high']; low = df['low']
+        atr = self._atr(df)
+
+        # remove invalid or expired zones
+        last_close = close.iloc[-1]
+        for z in zones[:]:
+            age = len(df) - z['start_idx']
+            if age > self.zone_extend:
+                zones.remove(z); continue
+            if z['dir'] == 'bull' and last_close < z['low']:
+                zones.remove(z); continue
+            if z['dir'] == 'bear' and last_close > z['high']:
+                zones.remove(z); continue
+
+        lookback = min(self.lookback, len(df))
+        subset = df.tail(lookback)
+        offset = len(df) - len(subset)
+        ph = self._pivot_highs(subset['high'])
+        pl = self._pivot_lows(subset['low'])
+
+        ma = self._ma(close)
+        trend_up = ma.iloc[-1] > ma.iloc[-2] if len(ma) > 1 else False
+        trend_down = ma.iloc[-1] < ma.iloc[-2] if len(ma) > 1 else False
+
+        for idx in pl:
+            i = idx + offset
+            if not trend_up:
+                continue
+            j = i + 1
+            if j >= len(df):
+                continue
+            rng = abs(close.iloc[j] - open_.iloc[j])
+            atr_v = atr.iloc[j]
+            if close.iloc[j] > high.iloc[i] and rng > atr_v:
+                ob_idx = j - 1
+                if ob_idx < 0 or close.iloc[ob_idx] >= open_.iloc[ob_idx]:
+                    continue
+                lower = min(open_.iloc[ob_idx], close.iloc[ob_idx])
+                upper = max(open_.iloc[ob_idx], close.iloc[ob_idx])
+                if (upper - lower) < self.min_zone_mult * atr.iloc[ob_idx]:
+                    continue
+                zones.append({'dir': 'bull', 'low': lower, 'high': upper, 'start_idx': ob_idx})
+
+        for idx in ph:
+            i = idx + offset
+            if not trend_down:
+                continue
+            j = i + 1
+            if j >= len(df):
+                continue
+            rng = abs(close.iloc[j] - open_.iloc[j])
+            atr_v = atr.iloc[j]
+            if close.iloc[j] < low.iloc[i] and rng > atr_v:
+                ob_idx = j - 1
+                if ob_idx < 0 or close.iloc[ob_idx] <= open_.iloc[ob_idx]:
+                    continue
+                lower = min(open_.iloc[ob_idx], close.iloc[ob_idx])
+                upper = max(open_.iloc[ob_idx], close.iloc[ob_idx])
+                if (upper - lower) < self.min_zone_mult * atr.iloc[ob_idx]:
+                    continue
+                zones.append({'dir': 'bear', 'low': lower, 'high': upper, 'start_idx': ob_idx})
+
+        self.zones[inst_key] = zones
+        return trend_up, trend_down
+
+    def _allows_df(self, inst_key: str, df: pd.DataFrame, direction: str) -> bool:
+        trend_up, trend_down = self._update_zones(inst_key, df)
+        price = df['close'].iloc[-1]
+        zones = self.zones.get(inst_key, [])
+        tol_ratio = self.entry_tol_pct
+        if direction == 'buy':
+            if not trend_up:
+                return False
+            for z in zones:
+                if z['dir'] != 'bull':
+                    continue
+                tol = (z['high'] - z['low']) * tol_ratio
+                if price >= z['low'] - tol and price <= z['high'] + tol:
+                    return True
+            return False
+        else:
+            if not trend_down:
+                return False
+            for z in zones:
+                if z['dir'] != 'bear':
+                    continue
+                tol = (z['high'] - z['low']) * tol_ratio
+                if price <= z['high'] + tol and price >= z['low'] - tol:
+                    return True
+            return False
+
+    def allows(self, inst: str, df: pd.DataFrame, direction: str) -> bool:
+        if not self.enabled:
+            return True
+        if not self._allows_df(inst, df, direction):
+            return False
+        if self.volume_filter:
+            avg_vol = df['volume'].tail(self.vol_lookback).mean()
+            if df['volume'].iloc[-1] < avg_vol * self.vol_mult:
+                return False
+        if self.mtf_enabled:
+            try:
+                df_htf = get_candles_tf(self.s, inst_id=inst, timeframe=self.mtf_tf, limit=300)
+            except Exception:
+                return False
+            if not self._allows_df(inst + "|HTF", df_htf, direction):
+                return False
+        return True
+
+# ---------------------------
 # Trading
 # ---------------------------
 def place_order(settings: Dict[str, any], side: str, size: str, inst_id: str,
@@ -413,6 +624,7 @@ def run_bot_vwap_only():
     specs = prefetch_instrument_specs(s, instruments)
     rr = float(s["REWARD_RISK_RATIO"])
     margin_per_trade = float(s.get("MARGIN_PER_TRADE_USDT", 90.0))
+    ob_filter = OBFilter(s)
 
     while True:
         try:
@@ -437,6 +649,9 @@ def run_bot_vwap_only():
                     vwap_lo = sig['vwap_low']
                     direction = sig['signal']
                     if direction is None or trend is None:
+                        continue
+
+                    if not ob_filter.allows(inst, df, direction):
                         continue
 
                     price = df['close'].iloc[-1]

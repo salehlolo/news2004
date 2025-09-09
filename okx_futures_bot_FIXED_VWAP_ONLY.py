@@ -182,14 +182,13 @@ def load_settings() -> Dict[str, any]:
     s["PARTIAL_TP_R"] = _f("PARTIAL_TP_R", 1.0)
     s["COOLDOWN_SEC"] = _i("COOLDOWN_SEC", 120)
 
-    s["PROGRESSIVE_TPSL_ENABLED"] = _b("PROGRESSIVE_TPSL_ENABLED", False)
-    s["PROG_BASE_TP_PCT"] = _f("PROG_BASE_TP_PCT", 1.0)
-    s["PROG_BASE_SL_PCT"] = _f("PROG_BASE_SL_PCT", 1.0)
-    s["PROG_MAX_TIER"] = _i("PROG_MAX_TIER", 6)
-    s["PROG_RESET_ON_WIN"] = _b("PROG_RESET_ON_WIN", True)
-    s["PROG_MAX_SL_PCT"] = _f("PROG_MAX_SL_PCT", 8.0)
-    s["PROG_DISABLE_PARTIAL_TP"] = _b("PROG_DISABLE_PARTIAL_TP", True)
-    if s["PROGRESSIVE_TPSL_ENABLED"] and s["PROG_DISABLE_PARTIAL_TP"]:
+    s["PROGRESSION_ENABLED"] = _b("PROGRESSION_ENABLED", False)
+    s["PROGRESSION_SCOPE"] = os.getenv("PROGRESSION_SCOPE", "global")
+    s["BASE_TP_PCT_ON_MARGIN"] = _f("BASE_TP_PCT_ON_MARGIN", 0.01)
+    s["BASE_SL_PCT_ON_MARGIN"] = _f("BASE_SL_PCT_ON_MARGIN", 0.01)
+    s["MAX_PROGRESSION_STEPS"] = _i("MAX_PROGRESSION_STEPS", 6)
+    s["INCLUDE_FEES_IN_TARGET"] = _b("INCLUDE_FEES_IN_TARGET", False)
+    if s["PROGRESSION_ENABLED"]:
         s["PARTIAL_TP_ENABLED"] = False
 
     return s
@@ -844,6 +843,27 @@ def load_bot_state(path: str) -> Optional[Dict]:
     except Exception:
         return None
 
+def load_progression_state(path: str, scope: str) -> Dict:
+    st = load_bot_state(path) or {}
+    prog = st.get("progression")
+    if not prog:
+        prog = {"scope": scope, "streaks": {}, "last_reset_ts": 0}
+        st["progression"] = prog
+        save_bot_state(path, st)
+    return prog
+
+def _prog_key(prog: Dict, symbol: str) -> str:
+    return "_global" if prog.get("scope", "global") == "global" else symbol
+
+def get_streak(prog: Dict, symbol: str) -> int:
+    return int(prog.get("streaks", {}).get(_prog_key(prog, symbol), 0))
+
+def set_streak(path: str, prog: Dict, symbol: str, val: int) -> None:
+    prog.setdefault("streaks", {})[_prog_key(prog, symbol)] = val
+    st = load_bot_state(path) or {}
+    st["progression"] = prog
+    save_bot_state(path, st)
+
 # ---------------------------
 # Main Loop
 # ---------------------------
@@ -859,31 +879,22 @@ def run_bot_vwap_only():
 
     cum, tot, win, loss, inst_stats = load_trade_history(history_file)
 
-    st = load_bot_state(state_file) or {}
-    loss_streak = int(st.get("loss_streak", 0))
-    current_instrument = st.get("current_instrument")
-    position_side = st.get("position_side")
-    entry_price = st.get("entry_price")
-    entry_size = st.get("entry_size")
-    tp_price = st.get("tp_price")
-    stop_price = st.get("stop_price")
-    entry_ct_val = st.get("entry_ct_val")
-    entry_time = st.get("entry_time")
-    entry_bar = st.get("entry_bar", 0)
-    entry_ordId = st.get("entry_ordId", "")
-    fee_entry = st.get("fee_entry", 0.0)
-    entry_fill_px = st.get("entry_fill_px")
-    exec_qty = st.get("exec_qty")
-    initial_stop_dist = st.get("initial_stop_dist", 0.0)
-    tier_before = st.get("tier_before", loss_streak)
-    tp_pct = st.get("tp_pct", 0.0)
-    sl_pct = st.get("sl_pct", 0.0)
-    pm = None
-    if current_instrument and position_side and entry_price and entry_size:
-        pm = PositionManager(s, position_side, float(entry_price), float(entry_size), float(entry_ct_val or 1), float(stop_price or entry_price), float(tp_price or entry_price), 0.0, entry_time, int(entry_bar))
-        pm.entry_ordId = entry_ordId
-        pm.fee_entry = float(fee_entry)
-        pm.fees = pm.fee_entry
+    prog = load_progression_state(state_file, s.get("PROGRESSION_SCOPE", "global"))
+    current_instrument = None
+    position_side = None
+    entry_price = entry_size = tp_price = stop_price = entry_ct_val = entry_time = None
+    entry_bar = 0
+    entry_ordId = ""
+    fee_entry = 0.0
+    entry_fill_px = None
+    exec_qty = None
+    initial_stop_dist = 0.0
+    streak_before = 0
+    tp_pct = 0.0
+    sl_pct = 0.0
+    target_profit_usdt = 0.0
+    target_loss_usdt = 0.0
+    entry_dir = ''
 
     cooldowns: Dict[str, float] = {}
     leverage_set: set = set()
@@ -936,48 +947,6 @@ def run_bot_vwap_only():
                         continue
                     ct = spec['ctVal']; lot = spec['lotSz']; min_sz = spec['minSz']; prec = spec['szPrec']; px_prec = spec.get('pxPrec',4)
 
-                    if s['PROGRESSIVE_TPSL_ENABLED']:
-                        tier_before = loss_streak
-                        if loss_streak == 0:
-                            tp_pct = s['PROG_BASE_TP_PCT']; sl_pct = s['PROG_BASE_SL_PCT']
-                        elif loss_streak == 1:
-                            tp_pct = s['PROG_BASE_TP_PCT']*2.0; sl_pct = s['PROG_BASE_SL_PCT']
-                        else:
-                            tp_pct = s['PROG_BASE_TP_PCT']*(2**loss_streak)
-                            sl_pct = s['PROG_BASE_SL_PCT']*(2**(loss_streak-1))
-                        sl_pct = min(sl_pct, s['PROG_MAX_SL_PCT'])
-                        if direction=='buy' and trend=='up':
-                            active_stop = round(price*(1 - sl_pct/100.0), px_prec)
-                            tp_price = round(price*(1 + tp_pct/100.0), px_prec)
-                            stop_dist = price - active_stop
-                        elif direction=='sell' and trend=='down':
-                            active_stop = round(price*(1 + sl_pct/100.0), px_prec)
-                            tp_price = round(price*(1 - tp_pct/100.0), px_prec)
-                            stop_dist = active_stop - price
-                        else:
-                            continue
-                    else:
-                        atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
-                        if direction=='buy' and trend=='up':
-                            active_stop = vwap_lo.iloc[-1] - s['VWAP_STOP_ATR_MULT']*atr_now
-                            stop_dist = price - active_stop
-                        elif direction=='sell' and trend=='down':
-                            active_stop = vwap_hi.iloc[-1] + s['VWAP_STOP_ATR_MULT']*atr_now
-                            stop_dist = active_stop - price
-                        else:
-                            continue
-                        if pd.isna(active_stop) or stop_dist <= 0:
-                            continue
-                        if stop_dist < s['MIN_STOP_ATR']*atr_now:
-                            continue
-                        tp_price = (price + stop_dist*rr) if direction=='buy' else (price - stop_dist*rr)
-                        tp_pct = 0.0; sl_pct = 0.0; tier_before = loss_streak
-
-                    if pd.isna(active_stop) or stop_dist <= 0:
-                        continue
-
-                    initial_stop_dist = stop_dist
-
                     # Position sizing by fixed margin with precheck
                     notional_target = margin_per_trade * s["LEVERAGE"]
                     contracts_raw = notional_target / (price * ct)
@@ -996,6 +965,49 @@ def run_bot_vwap_only():
                         continue
                     size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
                     margin = notional / s["LEVERAGE"]
+
+                    entry_dir = 'long' if direction=='buy' else 'short'
+                    if s['PROGRESSION_ENABLED']:
+                        streak_before = get_streak(prog, inst)
+                        L_eff = min(streak_before, s['MAX_PROGRESSION_STEPS'])
+                        base_tp = s['BASE_TP_PCT_ON_MARGIN']
+                        base_sl = s['BASE_SL_PCT_ON_MARGIN']
+                        tp_pct = base_tp * (2 ** L_eff)
+                        sl_pct = base_sl * (2 ** max(L_eff - 1, 0))
+                        margin_usdt = margin_per_trade
+                        target_profit_usdt = tp_pct * margin_usdt
+                        target_loss_usdt = sl_pct * margin_usdt
+                        delta_tp_pre = target_profit_usdt / (qty * ct)
+                        delta_sl_pre = target_loss_usdt / (qty * ct)
+                        atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
+                        if entry_dir == 'long':
+                            tp_price = round(price + delta_tp_pre, px_prec)
+                            active_stop = round(price - delta_sl_pre, px_prec)
+                            initial_stop_dist = price - active_stop
+                        else:
+                            tp_price = round(price - delta_tp_pre, px_prec)
+                            active_stop = round(price + delta_sl_pre, px_prec)
+                            initial_stop_dist = active_stop - price
+                        if initial_stop_dist < s['MIN_STOP_ATR'] * atr_now:
+                            continue
+                        log(f"[PROGRESSION] scope={prog.get('scope','global')} L={L_eff} -> TP={tp_pct*100:.2f}% SL={sl_pct*100:.2f}% on margin={margin_usdt:.2f} (target +{target_profit_usdt:.2f}/-{target_loss_usdt:.2f} USDT)")
+                    else:
+                        atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
+                        if entry_dir == 'long':
+                            active_stop = vwap_lo.iloc[-1] - s['VWAP_STOP_ATR_MULT']*atr_now
+                            initial_stop_dist = price - active_stop
+                            tp_price = price + initial_stop_dist*rr
+                        else:
+                            active_stop = vwap_hi.iloc[-1] + s['VWAP_STOP_ATR_MULT']*atr_now
+                            initial_stop_dist = active_stop - price
+                            tp_price = price - initial_stop_dist*rr
+                        if pd.isna(active_stop) or initial_stop_dist <= 0:
+                            continue
+                        if initial_stop_dist < s['MIN_STOP_ATR']*atr_now:
+                            continue
+                        tp_pct = sl_pct = 0.0
+                        streak_before = 0
+                        target_profit_usdt = target_loss_usdt = 0.0
 
                     side = 'buy' if direction=='buy' else 'sell'
                     try:
@@ -1032,31 +1044,19 @@ def run_bot_vwap_only():
                     entry_size = size_str
                     entry_ct_val = ct
                     entry_time = now_utc().isoformat()
-                    notional = exec_qty * entry_fill_px * ct
+                    notional = exec_qty * entry_price * ct
                     margin = notional / s['LEVERAGE']
 
-                    tp_price = (entry_price + stop_dist*rr) if position_side=='long' else (entry_price - stop_dist*rr)
-
-                    save_bot_state(state_file, {
-                        'loss_streak': loss_streak,
-                        'tier_before': tier_before,
-                        'tp_pct': tp_pct,
-                        'sl_pct': sl_pct,
-                        'current_instrument': current_instrument,
-                        'position_side': position_side,
-                        'entry_price': entry_price,
-                        'entry_size': entry_size,
-                        'tp_price': tp_price,
-                        'entry_ct_val': entry_ct_val,
-                        'entry_time': entry_time,
-                        'stop_price': active_stop,
-                        'entry_bar': len(df),
-                        'entry_ordId': entry_ordId,
-                        'entry_fill_px': entry_price,
-                        'exec_qty': exec_qty,
-                        'fee_entry': fee_entry,
-                        'initial_stop_dist': stop_dist
-                    })
+                    if s['PROGRESSION_ENABLED']:
+                        delta_tp = target_profit_usdt / (exec_qty * ct)
+                        delta_sl = target_loss_usdt / (exec_qty * ct)
+                        if position_side == 'long':
+                            tp_price = round(entry_price + delta_tp, px_prec)
+                            active_stop = round(entry_price - delta_sl, px_prec)
+                        else:
+                            tp_price = round(entry_price - delta_tp, px_prec)
+                            active_stop = round(entry_price + delta_sl, px_prec)
+                        initial_stop_dist = abs(entry_price - active_stop)
                     stop_price = active_stop
                     
                     try:
@@ -1064,11 +1064,12 @@ def run_bot_vwap_only():
                     except Exception:
                         balance_after = bal
 
-                    if not s['PROGRESSIVE_TPSL_ENABLED']:
-                        entry_dir = 'شراء' if position_side=='long' else 'بيع'
-                        send_telegram(s,
+                    if not s['PROGRESSION_ENABLED']:
+                        dir_txt = 'شراء' if position_side=='long' else 'بيع'
+                        send_telegram(
+                            s,
                             ("📈" if position_side=='long' else "📉") +
-                            f" دخول صفقة {entry_dir} على <b>{inst}</b>\n"
+                            f" دخول صفقة {dir_txt} على <b>{inst}</b>\n"
                             f"TF: {tf_main}\n"
                             f"الكمية: {exec_qty} | سعر الدخول (fill): {entry_price:.4f}\n"
                             f"الهامش: {margin:.2f} | النوتيونال: {notional:.2f} | الرافعة: {s['LEVERAGE']}x\n"
@@ -1076,10 +1077,12 @@ def run_bot_vwap_only():
                             f"ordId: {entry_ordId}"
                         )
                     else:
-                        send_telegram(s,
-                            f"[ENTRY][PROG_TPSL] {'LONG' if position_side=='long' else 'SHORT'} {inst}\n"
-                            f"qty={exec_qty} @ {entry_price:.4f}\n"
-                            f"Tier={tier_before} | TP={tp_pct:.2f}% ({tp_price:.4f}) | SL={sl_pct:.2f}% ({active_stop:.4f})"
+                        send_telegram(
+                            s,
+                            f"[ENTRY] {inst} {entry_dir.upper()} qty={exec_qty} @ {entry_price:.4f}\n"
+                            f"TP={tp_price} (+{target_profit_usdt:.2f} USDT on margin)\n"
+                            f"SL={active_stop} (-{target_loss_usdt:.2f} USDT on margin)\n"
+                            f"L={streak_before} | TP%={tp_pct*100:.2f} SL%={sl_pct*100:.2f} | scope={prog.get('scope','global')}"
                         )
                     log(f"[ENTRY] {entry_dir} {inst}: qty {exec_qty}, px {entry_price:.4f}")
                     opened=True
@@ -1106,7 +1109,7 @@ def run_bot_vwap_only():
                 atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
                 gap = abs(current_price - close_prev)
 
-                if s['PROGRESSIVE_TPSL_ENABLED']:
+                if s['PROGRESSION_ENABLED']:
                     active_stop = stop_price
                     tp_hit = current_price >= tp_price if position_side=='long' else current_price <= tp_price
                     if position_side=='long':
@@ -1177,11 +1180,16 @@ def run_bot_vwap_only():
                     cum += pnl_net; tot += 1
                     if pnl_net>=0: win += 1
                     else: loss += 1
-                    if s['PROGRESSIVE_TPSL_ENABLED']:
-                        if pnl_net > 0 and s.get('PROG_RESET_ON_WIN', True):
-                            loss_streak = 0
+                    if s['PROGRESSION_ENABLED']:
+                        if pnl_net > 0:
+                            streak_after = 0
                         elif pnl_net < 0:
-                            loss_streak = min(loss_streak + 1, s['PROG_MAX_TIER'])
+                            streak_after = min(streak_before + 1, s['MAX_PROGRESSION_STEPS'])
+                        else:
+                            streak_after = streak_before
+                        set_streak(state_file, prog, current_instrument, streak_after)
+                    else:
+                        streak_after = 0
                     hour_trades += 1; hour_profit += pnl_net
                     if pnl_net>=0: hour_wins += 1
                     else: hour_losses += 1
@@ -1214,21 +1222,25 @@ def run_bot_vwap_only():
                         'notional_entry': entry_price * qty_close * (entry_ct_val or 1.0),
                         'notional_exit': exit_fill_px * qty_close * (entry_ct_val or 1.0),
                         'leverage': s['LEVERAGE'],
-                        'tier_before': tier_before,
-                        'tp_pct': tp_pct,
-                        'sl_pct': sl_pct,
+                        'tp_on_margin_pct': tp_pct,
+                        'sl_on_margin_pct': sl_pct,
                         'tp_price': tp_price,
                         'sl_price': active_stop,
+                        'target_profit_usdt': target_profit_usdt,
+                        'target_loss_usdt': target_loss_usdt,
+                        'streak_before': streak_before,
+                        'streak_after': streak_after,
                     }
                     append_trade_record(history_file, rec)
-                    save_bot_state(state_file, {'loss_streak': loss_streak})
 
-                    if s['PROGRESSIVE_TPSL_ENABLED']:
-                        result_txt = 'TP hit ✅' if tp_hit else 'SL hit ❌'
-                        ls_text = f"reset to {loss_streak}" if pnl_net>0 and s.get('PROG_RESET_ON_WIN', True) else str(loss_streak)
-                        send_telegram(s,
-                            f"[EXIT][PROG_TPSL] {current_instrument} → {result_txt}\n"
-                            f"PnL_net={fmt_signed(pnl_net)} USDT | Tier(enter)={tier_before} → loss_streak {ls_text}"
+                    if s['PROGRESSION_ENABLED']:
+                        hit = 'TP' if tp_hit else ('SL-gap' if gap_exit else 'SL')
+                        send_telegram(
+                            s,
+                            f"[EXIT] {current_instrument} {hit} {entry_dir}\n"
+                            f"in={entry_price:.4f} out={exit_fill_px:.4f} qty={qty_close}\n"
+                            f"PnL_net={pnl_net:.2f} USDT | fees={fees:.2f}\n"
+                            f"L(before close)={streak_before} -> L(after close)={streak_after}"
                         )
                     else:
                         send_telegram(s,
@@ -1242,9 +1254,11 @@ def run_bot_vwap_only():
                         )
                     log(f"[EXIT] {('شراء' if position_side=='long' else 'بيع')} {current_instrument}: px {exit_fill_px:.4f}, PnL {pnl_net:.4f}")
 
-                    current_instrument=None; position_side=None
+                    current_instrument=None; position_side=None; entry_dir=''
                     entry_price=entry_size=tp_price=entry_ct_val=entry_time=None
-                    stop_price=None; tier_before=0; tp_pct=0.0; sl_pct=0.0
+                    stop_price=None; streak_before=0
+                    tp_pct=0.0; sl_pct=0.0
+                    target_profit_usdt=0.0; target_loss_usdt=0.0
 
             # Hourly report
             now = now_utc()

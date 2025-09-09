@@ -335,22 +335,29 @@ def prefetch_instrument_specs(settings: Dict[str, any], inst_list: List[str]) ->
         return spec
 
 def filter_valid_instruments(settings: Dict[str, any], inst_list: List[str]) -> List[str]:
-    """Remove instruments that are not recognised by OKX to avoid 51001 errors."""
+    """Remove instruments that are not recognised by OKX or inaccessible in the current environment."""
     try:
-        r = okx_request(settings, "GET", "/api/v5/public/instruments", params={'instType': 'SWAP'})
-        if r.get("code") != "0":
-            return inst_list
-        valid = {d.get("instId") for d in r.get("data", [])}
-        out = []
-        for inst in inst_list:
-            if inst in valid:
-                out.append(inst)
-            else:
-                log(f"[WARN] تجاهل الزوج غير المعروف {inst}")
-        return out or inst_list
+        r = okx_request(settings, "GET", "/api/v5/public/instruments", params={"instType": "SWAP"})
+        valid = {d.get("instId") for d in r.get("data", [])} if r.get("code") == "0" else set(inst_list)
     except Exception as e:
-        log(f"[WARN] فشل التحقق من الأزواج: {e}")
-        return inst_list
+        log(f"[WARN] فشل جلب قائمة الأدوات: {e}")
+        valid = set(inst_list)
+
+    out: List[str] = []
+    for inst in inst_list:
+        if inst not in valid:
+            log(f"[WARN] تجاهل الزوج غير المعروف {inst}")
+            continue
+        try:
+            rc = okx_request(settings, "GET", "/api/v5/market/candles", params={"instId": inst, "bar": "1m", "limit": 1})
+            if rc.get("code") != "0" or not rc.get("data"):
+                log(f"[WARN] استبعاد {inst}: {rc}")
+                continue
+        except Exception as e:
+            log(f"[WARN] استبعاد {inst}: {e}")
+            continue
+        out.append(inst)
+    return out
 
 def build_top_usdt_universe(settings: Dict[str, any]) -> Tuple[List[str], Dict[str, Dict[str, float]]]:
     if not settings.get('USE_TOP_USDT', False):

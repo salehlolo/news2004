@@ -188,6 +188,7 @@ def load_settings() -> Dict[str, any]:
     s["BASE_SL_PCT_ON_MARGIN"] = _f("BASE_SL_PCT_ON_MARGIN", 0.01)
     s["MAX_PROGRESSION_STEPS"] = _i("MAX_PROGRESSION_STEPS", 6)
     s["INCLUDE_FEES_IN_TARGET"] = _b("INCLUDE_FEES_IN_TARGET", False)
+    s["MARGIN_SAFETY_FRACTION"] = _f("MARGIN_SAFETY_FRACTION", 0.95)
     if s["PROGRESSION_ENABLED"]:
         s["PARTIAL_TP_ENABLED"] = False
 
@@ -970,6 +971,17 @@ def run_bot_vwap_only():
                     fee_buffer = notional * s["FEE_RATE"] * 2
                     required_margin = notional / s["LEVERAGE"] + fee_buffer
                     log(f"[SIZING] price={price:.4f} ctVal={ct} lotSz={lot} minSz={min_sz} contracts_raw={contracts_raw:.4f} qty_final={qty}")
+                    safety = float(s.get("MARGIN_SAFETY_FRACTION", 0.95))
+                    max_notional = bal * s["LEVERAGE"] * safety
+                    if notional > max_notional:
+                        qty_cap = math.floor((max_notional / (price * ct)) / lot) * lot
+                        if qty_cap < min_sz:
+                            log(f"[FILTER] {inst} reject: qty_below_min after margin cap")
+                            continue
+                        qty = qty_cap
+                        notional = qty * price * ct
+                        fee_buffer = notional * s["FEE_RATE"] * 2
+                        required_margin = notional / s["LEVERAGE"] + fee_buffer
                     if bal < required_margin:
                         log(f"[PRECHECK_FAIL] avail={bal:.2f} required={required_margin:.2f} notional={notional:.2f} qty={qty} leverage={s['LEVERAGE']}")
                         continue
@@ -987,6 +999,10 @@ def run_bot_vwap_only():
                         margin_usdt = margin_per_trade
                         target_profit_usdt = tp_pct * margin_usdt
                         target_loss_usdt = sl_pct * margin_usdt
+                        if s.get('INCLUDE_FEES_IN_TARGET', False):
+                            est_notional = price * qty * ct
+                            fee_est = 2.0 * s["FEE_RATE"] * est_notional
+                            target_profit_usdt += fee_est
                         delta_tp_pre = target_profit_usdt / (qty * ct)
                         delta_sl_pre = target_loss_usdt / (qty * ct)
                         atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]

@@ -192,6 +192,11 @@ def load_settings() -> Dict[str, any]:
     if s["PROGRESSION_ENABLED"]:
         s["PARTIAL_TP_ENABLED"] = False
 
+    # Guards (price/margin)
+    s["STRICT_PRICE_GUARD"] = _b("STRICT_PRICE_GUARD", True)
+    s["PRICE_SPIKE_GUARD"] = _b("PRICE_SPIKE_GUARD", True)
+    s["SPIKE_GUARD_TOLERANCE"] = _f("SPIKE_GUARD_TOLERANCE", 0.10)
+
     return s
 
 def sign_request(secret_key: str, timestamp: str, method: str, request_path: str, body: str) -> str:
@@ -266,6 +271,27 @@ def get_last_price(settings: Dict[str, any], inst_id: str) -> float:
     if r.get("code")!="0":
         raise RuntimeError(f"ticker error: {r}")
     return float(r["data"][0]["last"])
+
+def compute_safe_price(settings: Dict[str, any], inst_id: str, last_close: float, px_prec: int) -> Optional[float]:
+    """Return best available price rounded to instrument precision.
+    Uses best bid/ask/last; falls back to last_close; returns None if invalid."""
+    price: Optional[float] = None
+    try:
+        r = okx_request(settings, "GET", "/api/v5/market/ticker", params={'instId': inst_id})
+        if r.get("code") == "0" and r.get("data"):
+            d = r["data"][0]
+            cand = d.get("bidPx") or d.get("askPx") or d.get("last")
+            try:
+                price = float(cand) if cand not in (None, "") else None
+            except Exception:
+                price = None
+    except Exception:
+        price = None
+    if price is None or price <= 0 or (isinstance(price, float) and math.isnan(price)):
+        price = last_close
+    if price is None or price <= 0 or (isinstance(price, float) and math.isnan(price)):
+        return None
+    return round(price, int(px_prec or 4))
 
 def _precision_from_str(num_str: str) -> int:
     if num_str is None:
@@ -952,11 +978,22 @@ def run_bot_vwap_only():
                     if not confluence_filter.allows(inst, df, direction):
                         continue
 
-                    price = df['close'].iloc[-1]
                     spec = specs.get(inst)
                     if not spec:
                         continue
                     ct = spec['ctVal']; lot = spec['lotSz']; min_sz = spec['minSz']; prec = spec['szPrec']; px_prec = spec.get('pxPrec',4)
+
+                    # --- Price guard ---
+                    last_close = df['close'].iloc[-1]
+                    price = compute_safe_price(s, inst, last_close, px_prec) if s.get("STRICT_PRICE_GUARD", True) else round(last_close, px_prec)
+                    if price is None or price <= 0:
+                        log(f"[FILTER] {inst} reject: bad_price (price<=0)")
+                        continue
+                    if s.get("PRICE_SPIKE_GUARD", True):
+                        tol = float(s.get("SPIKE_GUARD_TOLERANCE", 0.10))
+                        if last_close > 0 and abs(price/last_close - 1.0) > tol:
+                            log(f"[FILTER] {inst} reject: price_spike_guard")
+                            continue
 
                     # Position sizing by fixed margin with precheck
                     notional_target = margin_per_trade * s["LEVERAGE"]
@@ -970,7 +1007,7 @@ def run_bot_vwap_only():
                     notional = qty * price * ct
                     fee_buffer = notional * s["FEE_RATE"] * 2
                     required_margin = notional / s["LEVERAGE"] + fee_buffer
-                    log(f"[SIZING] price={price:.4f} ctVal={ct} lotSz={lot} minSz={min_sz} contracts_raw={contracts_raw:.4f} qty_final={qty}")
+                    log(f"[SIZING] price={price:.{px_prec}f} ctVal={ct} lotSz={lot} minSz={min_sz} contracts_raw={contracts_raw:.4f} qty_final={qty}")
                     safety = float(s.get("MARGIN_SAFETY_FRACTION", 0.95))
                     max_notional = bal * s["LEVERAGE"] * safety
                     if notional > max_notional:
@@ -1039,8 +1076,19 @@ def run_bot_vwap_only():
                     try:
                         response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=s['LEVERAGE'], td_mode='cross', ord_type='market')
                     except Exception as ex:
-                        log(f"[ORDER_ERROR] {ex}")
-                        continue
+                        msg = str(ex)
+                        if ('51008' in msg or 'Insufficient USDT margin' in msg) and qty > min_sz:
+                            qty = max(min_sz, qty - lot)
+                            size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
+                            log(f"[RETRY] {inst} reducing qty to {size_str} due to 51008")
+                            try:
+                                response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=s['LEVERAGE'], td_mode='cross', ord_type='market')
+                            except Exception as ex2:
+                                log(f"[ORDER_ERROR] {ex2}")
+                                continue
+                        else:
+                            log(f"[ORDER_ERROR] {ex}")
+                            continue
 
                     try:
                         od = response.get('data', [])[0]
@@ -1097,20 +1145,20 @@ def run_bot_vwap_only():
                             ("📈" if position_side=='long' else "📉") +
                             f" دخول صفقة {dir_txt} على <b>{inst}</b>\n"
                             f"TF: {tf_main}\n"
-                            f"الكمية: {exec_qty} | سعر الدخول (fill): {entry_price:.4f}\n"
-                            f"الهامش: {margin:.2f} | النوتيونال: {notional:.2f} | الرافعة: {s['LEVERAGE']}x\n"
-                            f"SL (مبدئي/فعّال): {active_stop:.4f} | TP: {tp_price:.4f}\n"
+                        f"الكمية: {exec_qty} | سعر الدخول (fill): {entry_price:.{px_prec}f}\n"
+                        f"الهامش: {margin:.2f} | النوتيونال: {notional:.2f} | الرافعة: {s['LEVERAGE']}x\n"
+                        f"SL (مبدئي/فعّال): {active_stop:.{px_prec}f} | TP: {tp_price:.{px_prec}f}\n"
                             f"ordId: {entry_ordId}"
                         )
                     else:
                         send_telegram(
                             s,
-                            f"[ENTRY] {inst} {entry_dir.upper()} qty={exec_qty} @ {entry_price:.4f}\n"
-                            f"TP={tp_price} (+{target_profit_usdt:.2f} USDT on margin)\n"
-                            f"SL={active_stop} (-{target_loss_usdt:.2f} USDT on margin)\n"
+                        f"[ENTRY] {inst} {entry_dir.upper()} qty={exec_qty} @ {entry_price:.{px_prec}f}\n"
+                        f"TP={tp_price:.{px_prec}f} (+{target_profit_usdt:.2f} USDT on margin)\n"
+                        f"SL={active_stop:.{px_prec}f} (-{target_loss_usdt:.2f} USDT on margin)\n"
                             f"L={streak_before} | TP%={tp_pct*100:.2f} SL%={sl_pct*100:.2f} | scope={prog.get('scope','global')}"
                         )
-                    log(f"[ENTRY] {entry_dir} {inst}: qty {exec_qty}, px {entry_price:.4f}")
+                    log(f"[ENTRY] {entry_dir} {inst}: qty {exec_qty}, px {entry_price:.{px_prec}f}")
                     opened=True
                     break
 
@@ -1168,24 +1216,25 @@ def run_bot_vwap_only():
 
                 sl_hit = gap_exit or sl_confirm
 
-                log(f"[PM] price={current_price:.4f} atr={atr_now:.4f} stop={active_stop:.4f} tp={tp_price:.4f}")
+            px_prec_pm = specs.get(current_instrument, {}).get('pxPrec', 4)
+            log(f"[PM] price={current_price:.{px_prec_pm}f} atr={atr_now:.4f} stop={active_stop:.{px_prec_pm}f} tp={tp_price:.{px_prec_pm}f}")
 
-                if tp_hit or sl_hit:
-                    closing_side = 'sell' if position_side=='long' else 'buy'
-                    qty_close = float(exec_qty or entry_size)
-                    prec = specs.get(current_instrument, {}).get('szPrec', 0)
-                    size_close = f"{qty_close:.{prec}f}".rstrip('0').rstrip('.')
-                    try:
-                        response = place_order(s, side=closing_side, size=size_close, inst_id=current_instrument, leverage=10, td_mode='cross', ord_type='market')
-                    except Exception as ex:
-                        log(f"[ORDER_CLOSE_ERROR] {ex}")
-                        time.sleep(60); continue
+            if tp_hit or sl_hit:
+                closing_side = 'sell' if position_side=='long' else 'buy'
+                qty_close = float(exec_qty or entry_size)
+                prec = specs.get(current_instrument, {}).get('szPrec', 0)
+                size_close = f"{qty_close:.{prec}f}".rstrip('0').rstrip('.')
+                try:
+                    response = place_order(s, side=closing_side, size=size_close, inst_id=current_instrument, leverage=10, td_mode='cross', ord_type='market')
+                except Exception as ex:
+                    log(f"[ORDER_CLOSE_ERROR] {ex}")
+                    time.sleep(60); continue
 
-                    try:
-                        od = response.get('data', [])[0]
-                        exit_ordId = od.get('ordId', '')
-                    except Exception:
-                        exit_ordId = ''
+                try:
+                    od = response.get('data', [])[0]
+                    exit_ordId = od.get('ordId', '')
+                except Exception:
+                    exit_ordId = ''
 
                     fill=None
                     for _ in range(3):
@@ -1264,27 +1313,28 @@ def run_bot_vwap_only():
                         send_telegram(
                             s,
                             f"[EXIT] {current_instrument} {hit} {entry_dir}\n"
-                            f"in={entry_price:.4f} out={exit_fill_px:.4f} qty={qty_close}\n"
+                        f"in={entry_price:.{px_prec_pm}f} out={exit_fill_px:.{px_prec_pm}f} qty={qty_close}\n"
                             f"PnL_net={pnl_net:.2f} USDT | fees={fees:.2f}\n"
                             f"L(before close)={streak_before} -> L(after close)={streak_after}"
                         )
                     else:
-                        send_telegram(s,
+                        send_telegram(
+                            s,
                             f"✅ إغلاق {('شراء' if position_side=='long' else 'بيع')} <b>{current_instrument}</b> — {reason}\n"
-                            f"سعر الخروج (fill): {exit_fill_px:.4f}\n"
-                            f"SL/TP عند الخروج: SL={active_stop:.4f} | TP={tp_price:.4f}\n"
+                            f"سعر الخروج (fill): {exit_fill_px:.{px_prec_pm}f}\n"
+                            f"SL/TP عند الخروج: SL={active_stop:.{px_prec_pm}f} | TP={tp_price:.{px_prec_pm}f}\n"
                             f"PnL: {fmt_signed(pnl_net)} USDT  |  G:{fmt_signed(gross)}  F:{fees:.4f}\n"
                             f"R-realized: {r_realized:.2f}R  |  مدة الاحتفاظ: {hold_bars} بار / {hold_sec}s\n"
                             f"ordId(entry): {entry_ordId} | ordId(exit): {exit_ordId}\n"
                             f"الإجمالي: {cum:.4f} USDT"
                         )
-                    log(f"[EXIT] {('شراء' if position_side=='long' else 'بيع')} {current_instrument}: px {exit_fill_px:.4f}, PnL {pnl_net:.4f}")
+                log(f"[EXIT] {('شراء' if position_side=='long' else 'بيع')} {current_instrument}: px {exit_fill_px:.{px_prec_pm}f}, PnL {pnl_net:.4f}")
 
-                    current_instrument=None; position_side=None; entry_dir=''
-                    entry_price=entry_size=tp_price=entry_ct_val=entry_time=None
-                    stop_price=None; streak_before=0
-                    tp_pct=0.0; sl_pct=0.0
-                    target_profit_usdt=0.0; target_loss_usdt=0.0
+                current_instrument=None; position_side=None; entry_dir=''
+                entry_price=entry_size=tp_price=entry_ct_val=entry_time=None
+                stop_price=None; streak_before=0
+                tp_pct=0.0; sl_pct=0.0
+                target_profit_usdt=0.0; target_loss_usdt=0.0
 
             # Hourly report
             now = now_utc()

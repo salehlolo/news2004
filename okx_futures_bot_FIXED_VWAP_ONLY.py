@@ -418,6 +418,8 @@ def build_top_usdt_universe(settings: Dict[str, any]) -> Tuple[List[str], Dict[s
         log(f"[UNIVERSE] after_filters={len(pairs)} taking_top={settings['TOP_USDT_COUNT']}")
         pairs.sort(key=lambda x: x[1], reverse=True)
         top = [p[0] for p in pairs[:settings['TOP_USDT_COUNT']]]
+        # بعض الأزواج قد لا تكون متاحة فعليًا في بيئة demo، لذا نتحقق منها لتفادي أخطاء 51001
+        top = filter_valid_instruments(settings, top)
 
         if (not top) or (len(top) < settings.get('UNIVERSE_MIN_COUNT', 8)):
             manual = filter_valid_instruments(settings, settings['INSTRUMENT_LIST'])

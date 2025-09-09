@@ -344,12 +344,13 @@ def filter_valid_instruments(settings: Dict[str, any], inst_list: List[str]) -> 
         valid = set(inst_list)
 
     out: List[str] = []
+    tf = settings.get("TIMEFRAME", "1m")
     for inst in inst_list:
         if inst not in valid:
             log(f"[WARN] تجاهل الزوج غير المعروف {inst}")
             continue
         try:
-            rc = okx_request(settings, "GET", "/api/v5/market/candles", params={"instId": inst, "bar": "1m", "limit": 1})
+            rc = okx_request(settings, "GET", "/api/v5/market/candles", params={"instId": inst, "bar": tf, "limit": 1})
             if rc.get("code") != "0" or not rc.get("data"):
                 log(f"[WARN] استبعاد {inst}: {rc}")
                 continue

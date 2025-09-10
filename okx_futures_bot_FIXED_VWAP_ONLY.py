@@ -1226,7 +1226,7 @@ def run_bot_vwap_only():
                 prec = specs.get(current_instrument, {}).get('szPrec', 0)
                 size_close = f"{qty_close:.{prec}f}".rstrip('0').rstrip('.')
                 try:
-                    response = place_order(s, side=closing_side, size=size_close, inst_id=current_instrument, leverage=10, td_mode='cross', ord_type='market')
+                    response = place_order(s, side=closing_side, size=size_close, inst_id=current_instrument, leverage=s['LEVERAGE'], td_mode='cross', ord_type='market')
                 except Exception as ex:
                     log(f"[ORDER_CLOSE_ERROR] {ex}")
                     time.sleep(60); continue

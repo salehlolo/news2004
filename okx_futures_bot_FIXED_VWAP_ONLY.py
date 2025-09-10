@@ -1159,6 +1159,7 @@ def run_bot_vwap_only():
                             f"L={streak_before} | TP%={tp_pct*100:.2f} SL%={sl_pct*100:.2f} | scope={prog.get('scope','global')}"
                         )
                     log(f"[ENTRY] {entry_dir} {inst}: qty {exec_qty}, px {entry_price:.{px_prec}f}")
+                    entry_bar = len(df)
                     opened=True
                     break
 
@@ -1236,98 +1237,98 @@ def run_bot_vwap_only():
                 except Exception:
                     exit_ordId = ''
 
-                    fill=None
-                    for _ in range(3):
-                        fill = get_order_fill(s, current_instrument, exit_ordId)
-                        if fill: break
-                        time.sleep(1)
-                    if fill:
-                        exit_fill_px = fill['fillPx']
-                        fee_exit = abs(fill.get('fee', 0.0))
-                    else:
-                        exit_fill_px = current_price
-                        fee_exit = s['FEE_RATE'] * exit_fill_px * qty_close * (entry_ct_val or 1.0)
+                fill=None
+                for _ in range(3):
+                    fill = get_order_fill(s, current_instrument, exit_ordId)
+                    if fill: break
+                    time.sleep(1)
+                if fill:
+                    exit_fill_px = fill['fillPx']
+                    fee_exit = abs(fill.get('fee', 0.0))
+                else:
+                    exit_fill_px = current_price
+                    fee_exit = s['FEE_RATE'] * exit_fill_px * qty_close * (entry_ct_val or 1.0)
 
-                    ct = entry_ct_val if entry_ct_val and entry_ct_val>0 else 1.0
-                    gross = (exit_fill_px - entry_price)*qty_close*ct if position_side=='long' else (entry_price - exit_fill_px)*qty_close*ct
-                    fees = fee_entry + fee_exit
-                    pnl_net = gross - fees
-                    cum += pnl_net; tot += 1
-                    if pnl_net>=0: win += 1
-                    else: loss += 1
-                    if s['PROGRESSION_ENABLED']:
-                        if pnl_net > 0:
-                            streak_after = 0
-                        elif pnl_net < 0:
-                            streak_after = min(streak_before + 1, s['MAX_PROGRESSION_STEPS'])
-                        else:
-                            streak_after = streak_before
-                        set_streak(state_file, prog, current_instrument, streak_after)
-                    else:
+                ct = entry_ct_val if entry_ct_val and entry_ct_val>0 else 1.0
+                gross = (exit_fill_px - entry_price)*qty_close*ct if position_side=='long' else (entry_price - exit_fill_px)*qty_close*ct
+                fees = fee_entry + fee_exit
+                pnl_net = gross - fees
+                cum += pnl_net; tot += 1
+                if pnl_net>=0: win += 1
+                else: loss += 1
+                if s['PROGRESSION_ENABLED']:
+                    if pnl_net > 0:
                         streak_after = 0
-                    hour_trades += 1; hour_profit += pnl_net
-                    if pnl_net>=0: hour_wins += 1
-                    else: hour_losses += 1
-
-                    exit_time = now_utc().isoformat()
-                    hold_sec = int((now_utc() - datetime.fromisoformat(entry_time)).total_seconds()) if entry_time else 0
-                    r_realized = abs((exit_fill_px - entry_price) / initial_stop_dist) if initial_stop_dist>0 else 0.0
-                    reason = "TP" if tp_hit else ("SL-gap" if gap_exit else "SL-confirm")
-
-                    rec = {
-                        'timestamp_entry': entry_time,
-                        'timestamp_exit': exit_time,
-                        'tf': tf_main,
-                        'instrument': current_instrument,
-                        'side': position_side,
-                        'entry_ordId': entry_ordId,
-                        'exit_ordId': exit_ordId,
-                        'entry_fill_px': entry_price,
-                        'exit_fill_px': exit_fill_px,
-                        'exec_qty': qty_close,
-                        'ct_val': entry_ct_val,
-                        'initial_stop': initial_stop_dist,
-                        'exit_reason': reason,
-                        'gross_pnl': gross,
-                        'fees': fees,
-                        'pnl_net': pnl_net,
-                        'r_realized': r_realized,
-                        'hold_bars': hold_bars,
-                        'hold_time_sec': hold_sec,
-                        'notional_entry': entry_price * qty_close * (entry_ct_val or 1.0),
-                        'notional_exit': exit_fill_px * qty_close * (entry_ct_val or 1.0),
-                        'leverage': s['LEVERAGE'],
-                        'tp_on_margin_pct': tp_pct,
-                        'sl_on_margin_pct': sl_pct,
-                        'tp_price': tp_price,
-                        'sl_price': active_stop,
-                        'target_profit_usdt': target_profit_usdt,
-                        'target_loss_usdt': target_loss_usdt,
-                        'streak_before': streak_before,
-                        'streak_after': streak_after,
-                    }
-                    append_trade_record(history_file, rec)
-
-                    if s['PROGRESSION_ENABLED']:
-                        hit = 'TP' if tp_hit else ('SL-gap' if gap_exit else 'SL')
-                        send_telegram(
-                            s,
-                            f"[EXIT] {current_instrument} {hit} {entry_dir}\n"
-                        f"in={entry_price:.{px_prec_pm}f} out={exit_fill_px:.{px_prec_pm}f} qty={qty_close}\n"
-                            f"PnL_net={pnl_net:.2f} USDT | fees={fees:.2f}\n"
-                            f"L(before close)={streak_before} -> L(after close)={streak_after}"
-                        )
+                    elif pnl_net < 0:
+                        streak_after = min(streak_before + 1, s['MAX_PROGRESSION_STEPS'])
                     else:
-                        send_telegram(
-                            s,
-                            f"✅ إغلاق {('شراء' if position_side=='long' else 'بيع')} <b>{current_instrument}</b> — {reason}\n"
-                            f"سعر الخروج (fill): {exit_fill_px:.{px_prec_pm}f}\n"
-                            f"SL/TP عند الخروج: SL={active_stop:.{px_prec_pm}f} | TP={tp_price:.{px_prec_pm}f}\n"
-                            f"PnL: {fmt_signed(pnl_net)} USDT  |  G:{fmt_signed(gross)}  F:{fees:.4f}\n"
-                            f"R-realized: {r_realized:.2f}R  |  مدة الاحتفاظ: {hold_bars} بار / {hold_sec}s\n"
-                            f"ordId(entry): {entry_ordId} | ordId(exit): {exit_ordId}\n"
-                            f"الإجمالي: {cum:.4f} USDT"
-                        )
+                        streak_after = streak_before
+                    set_streak(state_file, prog, current_instrument, streak_after)
+                else:
+                    streak_after = 0
+                hour_trades += 1; hour_profit += pnl_net
+                if pnl_net>=0: hour_wins += 1
+                else: hour_losses += 1
+
+                exit_time = now_utc().isoformat()
+                hold_sec = int((now_utc() - datetime.fromisoformat(entry_time)).total_seconds()) if entry_time else 0
+                r_realized = abs((exit_fill_px - entry_price) / initial_stop_dist) if initial_stop_dist>0 else 0.0
+                reason = "TP" if tp_hit else ("SL-gap" if gap_exit else "SL-confirm")
+
+                rec = {
+                    'timestamp_entry': entry_time,
+                    'timestamp_exit': exit_time,
+                    'tf': tf_main,
+                    'instrument': current_instrument,
+                    'side': position_side,
+                    'entry_ordId': entry_ordId,
+                    'exit_ordId': exit_ordId,
+                    'entry_fill_px': entry_price,
+                    'exit_fill_px': exit_fill_px,
+                    'exec_qty': qty_close,
+                    'ct_val': entry_ct_val,
+                    'initial_stop': initial_stop_dist,
+                    'exit_reason': reason,
+                    'gross_pnl': gross,
+                    'fees': fees,
+                    'pnl_net': pnl_net,
+                    'r_realized': r_realized,
+                    'hold_bars': hold_bars,
+                    'hold_time_sec': hold_sec,
+                    'notional_entry': entry_price * qty_close * (entry_ct_val or 1.0),
+                    'notional_exit': exit_fill_px * qty_close * (entry_ct_val or 1.0),
+                    'leverage': s['LEVERAGE'],
+                    'tp_on_margin_pct': tp_pct,
+                    'sl_on_margin_pct': sl_pct,
+                    'tp_price': tp_price,
+                    'sl_price': active_stop,
+                    'target_profit_usdt': target_profit_usdt,
+                    'target_loss_usdt': target_loss_usdt,
+                    'streak_before': streak_before,
+                    'streak_after': streak_after,
+                }
+                append_trade_record(history_file, rec)
+
+                if s['PROGRESSION_ENABLED']:
+                    hit = 'TP' if tp_hit else ('SL-gap' if gap_exit else 'SL')
+                    send_telegram(
+                        s,
+                        f"[EXIT] {current_instrument} {hit} {entry_dir}\n"
+                    f"in={entry_price:.{px_prec_pm}f} out={exit_fill_px:.{px_prec_pm}f} qty={qty_close}\n"
+                        f"PnL_net={pnl_net:.2f} USDT | fees={fees:.2f}\n"
+                        f"L(before close)={streak_before} -> L(after close)={streak_after}"
+                    )
+                else:
+                    send_telegram(
+                        s,
+                        f"✅ إغلاق {('شراء' if position_side=='long' else 'بيع')} <b>{current_instrument}</b> — {reason}\n"
+                        f"سعر الخروج (fill): {exit_fill_px:.{px_prec_pm}f}\n"
+                        f"SL/TP عند الخروج: SL={active_stop:.{px_prec_pm}f} | TP={tp_price:.{px_prec_pm}f}\n"
+                        f"PnL: {fmt_signed(pnl_net)} USDT  |  G:{fmt_signed(gross)}  F:{fees:.4f}\n"
+                        f"R-realized: {r_realized:.2f}R  |  مدة الاحتفاظ: {hold_bars} بار / {hold_sec}s\n"
+                        f"ordId(entry): {entry_ordId} | ordId(exit): {exit_ordId}\n"
+                        f"الإجمالي: {cum:.4f} USDT"
+                    )
                 log(f"[EXIT] {('شراء' if position_side=='long' else 'بيع')} {current_instrument}: px {exit_fill_px:.{px_prec_pm}f}, PnL {pnl_net:.4f}")
 
                 current_instrument=None; position_side=None; entry_dir=''

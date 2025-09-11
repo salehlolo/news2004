@@ -11,6 +11,7 @@
 # NOTE: Reads the same .env keys as your original bot. Keep your secrets safe.
 #
 # Author: adapted for Saleh (VWAP-only)
+# Confluence filter inspired by AlgoAlpha's HMA/pivot order-block approach
 
 import os
 import time
@@ -22,6 +23,10 @@ from typing import Dict, Optional, Tuple, List
 
 import requests
 import pandas as pd
+import numpy as np
+import math
+
+leverage_set = set()
 
 def log(message: str) -> None:
     print(message, flush=True)
@@ -31,6 +36,9 @@ def now_utc() -> datetime:
 
 def iso_utc_ms() -> str:
     return now_utc().isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+def fmt_signed(x: float) -> str:
+    return f"+{x:.4f}" if x >= 0 else f"-{abs(x):.4f}"
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -90,18 +98,33 @@ def load_settings() -> Dict[str, any]:
     s["TIMEFRAME"] = os.getenv("TIMEFRAME","30m")
     s["BASE_URL"] = os.getenv("OKX_BASE_URL","https://www.okx.com")
 
-    # Risk/fees
+    # Fees and fixed margin per trade
     def _f(name, default):
         val = os.getenv(name)
         try:
             return float(val) if val is not None else default
         except Exception:
             return default
+    def _i(name, default):
+        val = os.getenv(name)
+        try:
+            return int(val) if val is not None else default
+        except Exception:
+            return default
+    def _b(name, default=False):
+        val = os.getenv(name)
+        if val is None:
+            return default
+        return str(val).lower() in ("1","true","on","yes")
+
     s["FEE_RATE"] = _f("FEE_RATE", 0.0006)
-    s["RISK_PER_TRADE_PCT"] = _f("RISK_PER_TRADE_PCT", 0.01)
-    s["DAILY_RISK_PCT"] = _f("DAILY_RISK_PCT", 0.0)  # 0 disables daily stop
     s["REWARD_RISK_RATIO"] = _f("REWARD_RISK_RATIO", 5.0)
-    s["FIXED_CAPITAL_USDT"] = _f("FIXED_CAPITAL_USDT", 0.0)  # if >0, sizing uses this base capital instead of balance
+    s["MARGIN_PER_TRADE_USDT"] = _f("MARGIN_PER_TRADE_USDT", 90.0)
+    s["LEVERAGE"] = _i("LEVERAGE", 10)
+    s["TD_MODE"] = os.getenv("TD_MODE", "cross").lower()
+    s["AUTO_ADJUST_MARGIN"] = _b("AUTO_ADJUST_MARGIN", True)
+    s["MIN_MARGIN_PER_TRADE_USDT"] = _f("MIN_MARGIN_PER_TRADE_USDT", 15.0)
+    s["ENVIRONMENT"] = os.getenv("ENVIRONMENT","demo")
 
     # Files
     s["DATA_DIR"] = os.getenv("DATA_DIR",".")
@@ -110,6 +133,78 @@ def load_settings() -> Dict[str, any]:
 
     # Reporting
     s["VERBOSE"] = int(os.getenv("VERBOSE","1") or "1")
+
+    # Confluence filter settings (Trend + Order Block + Volume)
+    def _i(name, default):
+        val = os.getenv(name)
+        try:
+            return int(val) if val is not None else default
+        except Exception:
+            return default
+    def _b(name, default=False):
+        val = os.getenv(name)
+        if val is None:
+            return default
+        return str(val).lower() in ("1","true","yes","on")
+
+    s["UNIFIED_FILTER_ENABLED"] = _b("UNIFIED_FILTER_ENABLED", False)
+    s["OB_TREND_MA_TYPE"] = os.getenv("OB_TREND_MA_TYPE", "HMA")
+    s["OB_TREND_MA_LEN"] = _i("OB_TREND_MA_LEN", 55)
+    s["OB_PIVOT_LEFT"] = _i("OB_PIVOT_LEFT", 3)
+    s["OB_PIVOT_RIGHT"] = _i("OB_PIVOT_RIGHT", 3)
+    s["OB_LOOKBACK"] = _i("OB_LOOKBACK", 300)
+    s["OB_ZONE_EXTEND_BARS"] = _i("OB_ZONE_EXTEND_BARS", 500)
+    s["OB_INVALIDATION_MODE"] = os.getenv("OB_INVALIDATION_MODE", "CLOSE_THROUGH")
+    s["OB_MIN_ZONE_SIZE_MULT"] = _f("OB_MIN_ZONE_SIZE_MULT", 0.25)
+    s["OB_ATR_LEN"] = _i("OB_ATR_LEN", 14)
+    s["OB_MTF_ENABLED"] = _b("OB_MTF_ENABLED", False)
+    s["OB_MTF_TIMEFRAME"] = os.getenv("OB_MTF_TIMEFRAME", "1h")
+    s["OB_ENTRY_TOLERANCE_PCT"] = _f("OB_ENTRY_TOLERANCE_PCT", 0.15)
+    s["OB_VOLUME_LOOKBACK"] = _i("OB_VOLUME_LOOKBACK", 20)
+    s["OB_VOLUME_MULT"] = _f("OB_VOLUME_MULT", 1.2)
+
+    s["DC_MODE"] = _b("DC_MODE", False)
+    s["DC_LEN"] = _i("DC_LEN", 20)
+
+    # Top40 universe and dynamic TP/SL settings
+    s["USE_TOP_USDT"] = _b("USE_TOP_USDT", True)
+    s["TOP_USDT_MODE"] = os.getenv("TOP_USDT_MODE", "override")
+    s["TOP_USDT_COUNT"] = _i("TOP_USDT_COUNT", 40)
+    s["TOP_USDT_SORT"] = os.getenv("TOP_USDT_SORT", "volCcy24h")
+    s["TOP_USDT_MIN_VOL"] = _f("TOP_USDT_MIN_VOL", 1000000)
+    s["ALLOW_QUANTO"] = _b("ALLOW_QUANTO", False)
+    s["UNIVERSE_MIN_COUNT"] = _i("UNIVERSE_MIN_COUNT", 8)
+    s["UNIVERSE_ENABLE_FALLBACK"] = _b("UNIVERSE_ENABLE_FALLBACK", True)
+
+    s["VWAP_STOP_ATR_MULT"] = _f("VWAP_STOP_ATR_MULT", 0.5)
+    s["MIN_STOP_ATR"] = _f("MIN_STOP_ATR", 0.4)
+    s["MIN_HOLD_BARS"] = _i("MIN_HOLD_BARS", 1)
+    s["BE_TRIGGER_R"] = _f("BE_TRIGGER_R", 1.0)
+    s["PARTIAL_TP_ENABLED"] = _b("PARTIAL_TP_ENABLED", True)
+    s["PARTIAL_TP_PCT"] = _f("PARTIAL_TP_PCT", 0.5)
+    s["PARTIAL_TP_R"] = _f("PARTIAL_TP_R", 1.0)
+    s["COOLDOWN_SEC"] = _i("COOLDOWN_SEC", 120)
+
+    s["PROGRESSION_ENABLED"] = _b("PROGRESSION_ENABLED", False)
+    s["PROGRESSION_SCOPE"] = os.getenv("PROGRESSION_SCOPE", "global")
+    s["BASE_TP_PCT_ON_MARGIN"] = _f("BASE_TP_PCT_ON_MARGIN", 0.01)
+    s["BASE_SL_PCT_ON_MARGIN"] = _f("BASE_SL_PCT_ON_MARGIN", 0.01)
+    s["MAX_PROGRESSION_STEPS"] = _i("MAX_PROGRESSION_STEPS", 6)
+    s["PROGRESSION_BASIS"] = os.getenv("PROGRESSION_BASIS", "margin").lower()
+    s["INCLUDE_FEES_IN_TARGET"] = _b("INCLUDE_FEES_IN_TARGET", False)
+    s["MARGIN_SAFETY_FRACTION"] = _f("MARGIN_SAFETY_FRACTION", 0.95)
+    if s["PROGRESSION_ENABLED"]:
+        s["PARTIAL_TP_ENABLED"] = False
+
+    s["DISABLE_SHRINK_ON_51008"] = _b("DISABLE_SHRINK_ON_51008", True)
+    s["SIZE_REDUCTION_FACTOR"] = _f("SIZE_REDUCTION_FACTOR", 0.80)
+    s["FEE_BUFFER_MULT"] = _f("FEE_BUFFER_MULT", 0.0)
+    s["POS_MODE"] = os.getenv("POS_MODE", "net")
+
+    # Guards (price/margin)
+    s["STRICT_PRICE_GUARD"] = _b("STRICT_PRICE_GUARD", True)
+    s["PRICE_SPIKE_GUARD"] = _b("PRICE_SPIKE_GUARD", True)
+    s["SPIKE_GUARD_TOLERANCE"] = _f("SPIKE_GUARD_TOLERANCE", 0.10)
 
     return s
 
@@ -120,7 +215,9 @@ def sign_request(secret_key: str, timestamp: str, method: str, request_path: str
 
 def okx_request(settings: Dict[str, any], method: str, path: str, params: Optional[Dict]=None, body: Optional[Dict]=None, private: bool=False) -> Dict:
     url = settings["BASE_URL"] + path
-    headers = {'Content-Type': 'application/json', 'x-simulated-trading': '1'}
+    headers = {'Content-Type': 'application/json'}
+    env = str(settings.get("ENVIRONMENT", "demo")).lower()
+    headers['x-simulated-trading'] = '1' if env == 'demo' else '0'
     if private:
         ts = iso_utc_ms()
         body_str = json.dumps(body) if body else ''
@@ -154,6 +251,17 @@ def send_telegram(settings: Dict[str, any], message: str) -> None:
     except Exception as e:
         log(f"[Telegram] send failed: {e}")
 
+
+def scan_okx(settings: Dict[str, any]) -> None:
+    """Simple connectivity check to ensure the script runs."""
+    try:
+        r = okx_request(settings, "GET", "/api/v5/public/time")
+        ts = r.get("data", [{}])[0].get("ts", "?")
+        log(f"[SCAN] OKX server time: {ts}")
+    except Exception as e:
+        log(f"[SCAN_ERROR] {e}")
+        send_telegram(settings, f"⚠️ فشل الفحص: {e}")
+
 # ---------------------------
 # Exchange Helpers
 # ---------------------------
@@ -167,48 +275,246 @@ def get_account_balance(settings: Dict[str, any], currency: str='USDT') -> float
             total += float(d.get("availBal",0))
     return total
 
+def get_leverage_info(settings, inst_id: str, mgn_mode: str):
+    return okx_request(settings, "GET", "/api/v5/account/leverage-info",
+                       params={"instId": inst_id, "mgnMode": mgn_mode}, private=True)
+
+def set_leverage(settings, inst_id: str, mgn_mode: str, lever: int, pos_mode: str):
+    # in hedge mode need to set both long/short sides
+    if pos_mode == "long_short":
+        for side in ("long", "short"):
+            body = {"instId": inst_id, "mgnMode": mgn_mode, "lever": str(lever), "posSide": side}
+            r = okx_request(settings, "POST", "/api/v5/account/set-leverage", body=body, private=True)
+            if r.get("code") != "0":
+                raise RuntimeError(f"set-leverage {side} failed: {r}")
+        return
+    body = {"instId": inst_id, "mgnMode": mgn_mode, "lever": str(lever)}
+    r = okx_request(settings, "POST", "/api/v5/account/set-leverage", body=body, private=True)
+    if r.get("code") != "0":
+        raise RuntimeError(f"set-leverage failed: {r}")
+
 def get_last_price(settings: Dict[str, any], inst_id: str) -> float:
     r = okx_request(settings, "GET", "/api/v5/market/ticker", params={'instId': inst_id})
     if r.get("code")!="0":
         raise RuntimeError(f"ticker error: {r}")
     return float(r["data"][0]["last"])
 
-def get_instrument_specs(settings: Dict[str, any], inst_id: str) -> Tuple[float,float]:
+def compute_safe_price(settings: Dict[str, any], inst_id: str, last_close: float, px_prec: int) -> Optional[float]:
+    """Return best available price rounded to instrument precision.
+    Uses best bid/ask/last; falls back to last_close; returns None if invalid."""
+    price: Optional[float] = None
+    try:
+        r = okx_request(settings, "GET", "/api/v5/market/ticker", params={'instId': inst_id})
+        if r.get("code") == "0" and r.get("data"):
+            d = r["data"][0]
+            cand = d.get("bidPx") or d.get("askPx") or d.get("last")
+            try:
+                price = float(cand) if cand not in (None, "") else None
+            except Exception:
+                price = None
+    except Exception:
+        price = None
+    if price is None or price <= 0 or (isinstance(price, float) and math.isnan(price)):
+        price = last_close
+    if price is None or price <= 0 or (isinstance(price, float) and math.isnan(price)):
+        return None
+    return round(price, int(px_prec or 4))
+
+def _precision_from_str(num_str: str) -> int:
+    if num_str is None:
+        return 0
+    if isinstance(num_str, (int, float)):
+        num_str = str(num_str)
+    if '.' in num_str:
+        return len(num_str.split('.')[1].rstrip('0'))
+    return 0
+
+def calc_atr(df: pd.DataFrame, length: int=14) -> pd.Series:
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(length).mean()
+
+def get_order_fill(settings: Dict[str, any], inst_id: str, ord_id: str) -> Optional[Dict[str, float]]:
+    r = okx_request(settings, "GET", "/api/v5/trade/fills", params={'instId':inst_id,'ordId':ord_id}, private=True)
+    if r.get('code') != '0' or not r.get('data'):
+        return None
+    d = r['data'][0]
+    try:
+        return {
+            'fillPx': float(d.get('fillPx', 0)),
+            'fillSz': float(d.get('fillSz', 0)),
+            'fee': float(d.get('fee', 0))
+        }
+    except Exception:
+        return None
+
+def get_instrument_specs(settings: Dict[str, any], inst_id: str) -> Optional[Dict[str, float]]:
     r = okx_request(settings, "GET", "/api/v5/public/instruments", params={'instType':'SWAP','instId':inst_id})
     if r.get("code")!="0" or not r.get("data"):
-        return (1.0, 1.0)
+        return None
     info = r["data"][0]
-    lot = info.get("lotSz") or info.get("lotSize") or info.get("minSz")
-    ct = info.get("ctVal")
     try:
-        lot_f = float(lot) if lot is not None else 1.0
+        ct = float(info["ctVal"])
+        lot = float(info["lotSz"])
+        min_sz = float(info["minSz"])
+        prec = _precision_from_str(info["lotSz"])
+        tick = float(info.get("tickSz", 0.1))
+        px_prec = _precision_from_str(info.get("tickSz", "0.1"))
+        return {"ctVal": ct, "lotSz": lot, "minSz": min_sz, "szPrec": prec, "tickSz": tick, "pxPrec": px_prec}
     except Exception:
-        lot_f = 1.0
-    try:
-        ct_f = float(ct) if ct is not None else 1.0
-    except Exception:
-        ct_f = 1.0
-    return (lot_f, ct_f)
+        log(f"[SPEC_ERROR] {inst_id} -> {info}")
+        return None
 
-def prefetch_instrument_specs(settings: Dict[str, any], inst_list: List[str]) -> Dict[str, Tuple[float,float]]:
-    spec = {i:(1.0,1.0) for i in inst_list}
+def prefetch_instrument_specs(settings: Dict[str, any], inst_list: List[str]) -> Dict[str, Dict[str, float]]:
+    spec: Dict[str, Dict[str, float]] = {}
     try:
         r = okx_request(settings, "GET", "/api/v5/public/instruments", params={'instType':'SWAP'})
         if r.get("code")!="0":
             return spec
         for info in r.get("data",[]):
             iid = info.get("instId")
-            if iid in spec:
-                lot = info.get("lotSz") or info.get("lotSize") or info.get("minSz")
-                ct = info.get("ctVal")
-                try: lot_f = float(lot) if lot is not None else 1.0
-                except: lot_f = 1.0
-                try: ct_f = float(ct) if ct is not None else 1.0
-                except: ct_f = 1.0
-                spec[iid] = (lot_f, ct_f)
+            if iid in inst_list:
+                sp = get_instrument_specs(settings, iid)
+                if sp:
+                    spec[iid] = sp
         return spec
-    except Exception:
+    except Exception as e:
+        log(f"[SPEC_FETCH_ERROR] {e}")
         return spec
+
+def filter_valid_instruments(settings: Dict[str, any], inst_list: List[str]) -> List[str]:
+    """Remove instruments that are not recognised by OKX or inaccessible in the current environment."""
+    try:
+        r = okx_request(settings, "GET", "/api/v5/public/instruments", params={"instType": "SWAP"})
+        valid = {d.get("instId") for d in r.get("data", [])} if r.get("code") == "0" else set(inst_list)
+    except Exception as e:
+        log(f"[WARN] فشل جلب قائمة الأدوات: {e}")
+        valid = set(inst_list)
+
+    out: List[str] = []
+    tf = settings.get("TIMEFRAME", "1m")
+    for inst in inst_list:
+        if inst not in valid:
+            log(f"[WARN] تجاهل الزوج غير المعروف {inst}")
+            continue
+        try:
+            rc = okx_request(settings, "GET", "/api/v5/market/candles", params={"instId": inst, "bar": tf, "limit": 1})
+            if rc.get("code") != "0" or not rc.get("data"):
+                log(f"[WARN] استبعاد {inst}: {rc}")
+                continue
+        except Exception as e:
+            log(f"[WARN] استبعاد {inst}: {e}")
+            continue
+        out.append(inst)
+    return out
+
+def build_top_usdt_universe(settings: Dict[str, any]) -> Tuple[List[str], Dict[str, Dict[str, float]]]:
+    if not settings.get('USE_TOP_USDT', False):
+        insts = filter_valid_instruments(settings, settings['INSTRUMENT_LIST'])
+        specs = prefetch_instrument_specs(settings, insts)
+        return insts, specs
+    log(f"[UNIVERSE] env={settings.get('ENVIRONMENT')} mode={settings.get('TOP_USDT_MODE')}")
+    try:
+        r = okx_request(settings, 'GET', '/api/v5/public/instruments', params={'instType':'SWAP'})
+        if r.get('code') != '0':
+            raise RuntimeError(str(r))
+        allowed: List[str] = []
+        meta: Dict[str, Dict[str, float]] = {}
+        for info in r.get('data', []):
+            if info.get('settleCcy') != 'USDT':
+                continue
+            if not settings.get('ALLOW_QUANTO', False) and info.get('ctType') == 'inverse':
+                continue
+            state = (info.get('state') or '').lower()
+            if state in ('suspend', 'delisted', 'offline'):
+                continue
+            iid = info.get('instId')
+            sp = {
+                'ctVal': float(info.get('ctVal',1)),
+                'lotSz': float(info.get('lotSz',1)),
+                'minSz': float(info.get('minSz',1)),
+                'szPrec': _precision_from_str(info.get('lotSz','1')),
+                'tickSz': float(info.get('tickSz',0.1)),
+                'pxPrec': _precision_from_str(info.get('tickSz','0.1'))
+            }
+            allowed.append(iid)
+            meta[iid] = sp
+        log(f"[UNIVERSE] prefilter_total={len(allowed)}")
+
+        tick = okx_request(settings, 'GET', '/api/v5/market/tickers', params={'instType':'SWAP'})
+        vols: Dict[str, float] = {}
+        for d in tick.get('data', []):
+            val = d.get(settings['TOP_USDT_SORT'])
+            try:
+                v = float(val) if val not in (None, '') else 0.0
+            except Exception:
+                v = 0.0
+            if v == 0.0:
+                v24 = d.get('vol24h')
+                last = d.get('last')
+                try:
+                    v = float(v24 or 0) * float(last or 0)
+                except Exception:
+                    v = 0.0
+            vols[d['instId']] = v
+        missing = len([iid for iid in allowed if iid not in vols])
+        log(f"[UNIVERSE] joined_tickers={len(vols)} missing={missing}")
+        zeros = sum(1 for iid in allowed if vols.get(iid,0)==0)
+        log(f"[UNIVERSE] zeros_metric={zeros} nonzeros_metric={len(allowed)-zeros}")
+
+        pairs = []
+        min_vol = float(settings.get('TOP_USDT_MIN_VOL',0))
+        env = str(settings.get('ENVIRONMENT','')).lower()
+        for iid in allowed:
+            if iid not in vols:
+                continue  # missing ticker data often indicates demo-inaccessible instrument (51001)
+            vol = vols.get(iid,0.0)
+            if vol >= min_vol or (vol==0.0 and env=='demo' and min_vol==0):
+                pairs.append((iid, vol))
+        log(f"[UNIVERSE] after_filters={len(pairs)} taking_top={settings['TOP_USDT_COUNT']}")
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        top = [p[0] for p in pairs[:settings['TOP_USDT_COUNT']]]
+        # بعض الأزواج قد لا تكون متاحة فعليًا في بيئة demo، لذا نتحقق منها لتفادي أخطاء 51001
+        top = filter_valid_instruments(settings, top)
+
+        if (not top) or (len(top) < settings.get('UNIVERSE_MIN_COUNT', 8)):
+            manual = filter_valid_instruments(settings, settings['INSTRUMENT_LIST'])
+            if settings.get('TOP_USDT_MODE','override') == 'merge':
+                merged = list(dict.fromkeys(top + manual))
+                top = merged
+            if (not top) and settings.get('UNIVERSE_ENABLE_FALLBACK', True):
+                default = ['BTC-USDT-SWAP','ETH-USDT-SWAP','SOL-USDT-SWAP','XRP-USDT-SWAP',
+                           'BNB-USDT-SWAP','DOGE-USDT-SWAP','TRX-USDT-SWAP','TON-USDT-SWAP']
+                default = filter_valid_instruments(settings, default)
+                top = default[:max(settings.get('UNIVERSE_MIN_COUNT',8), len(default))]
+            log(f"[UNIVERSE][FALLBACK] using {len(top)} instruments")
+
+        examples = ', '.join([f"{iid}={vols.get(iid,0):.2f}" for iid in top[:3]])
+        log(f"[UNIVERSE] selected {len(top)} instruments")
+        if examples:
+            log(f"[UNIVERSE] examples: {examples}")
+
+        specs: Dict[str, Dict[str, float]] = {}
+        missing: List[str] = []
+        for iid in top:
+            if iid in meta:
+                specs[iid] = meta[iid]
+            else:
+                missing.append(iid)
+        if missing:
+            specs.update(prefetch_instrument_specs(settings, missing))
+        return top, specs
+    except Exception as e:
+        log(f"[UNIVERSE_ERROR] {e}; fallback to manual list")
+        insts = filter_valid_instruments(settings, settings['INSTRUMENT_LIST'])
+        specs = prefetch_instrument_specs(settings, insts)
+        return insts, specs
 
 # ---------------------------
 # Data & Signals (VWAP ONLY)
@@ -268,7 +574,7 @@ def anchored_vwap_series(df: pd.DataFrame, start_idx: int) -> pd.Series:
         vwap_masked.iloc[:start_idx] = float('nan')
     return vwap_masked
 
-def vwap_signal(df: pd.DataFrame) -> Dict[str, any]:
+def vwap_signal(df: pd.DataFrame, settings: Dict[str, any]) -> Dict[str, any]:
     highs=df['high']; lows=df['low']; closes=df['close']
     sh, sl = _pivot_indices(highs, lows)
     if len(sh)<2 or len(sl)<2:
@@ -278,21 +584,25 @@ def vwap_signal(df: pd.DataFrame) -> Dict[str, any]:
     last_h, prev_h = sh[-1], sh[-2]
     last_l, prev_l = sl[-1], sl[-2]
 
-    # Simple trend test (higher highs & higher lows vs lower highs & lower lows)
     trend=None
     if highs.iloc[last_h]>highs.iloc[prev_h] and lows.iloc[last_l]>lows.iloc[prev_l]:
         trend='up'
     elif highs.iloc[last_h]<highs.iloc[prev_h] and lows.iloc[last_l]<lows.iloc[prev_l]:
         trend='down'
 
-    # Anchors
-    a_hi_idx = last_h
-    a_lo_idx = last_l
+    dc_mode = bool(settings.get('DC_MODE'))
+    dc_len = int(settings.get('DC_LEN',20))
+    if dc_mode and len(df) >= dc_len:
+        a_hi_idx = len(highs) - dc_len + int(np.argmax(highs.tail(dc_len).values))
+        a_lo_idx = len(lows) - dc_len + int(np.argmin(lows.tail(dc_len).values))
+    else:
+        a_hi_idx = last_h
+        a_lo_idx = last_l
 
-    vwap_hi = anchored_vwap_series(df, a_hi_idx)  # anchored at last swing high
-    vwap_lo = anchored_vwap_series(df, a_lo_idx)  # anchored at last swing low
+    vwap_hi = anchored_vwap_series(df, a_hi_idx)
+    vwap_lo = anchored_vwap_series(df, a_lo_idx)
+    log(f"[VWAP] mode={'donchian' if dc_mode else 'pivots'} a_hi_idx={a_hi_idx} a_lo_idx={a_lo_idx}")
 
-    # Entry logic (continuation breakout of the "opposite" VWAP)
     sig=None
     if trend=='up':
         if len(closes)>=2 and not pd.isna(vwap_hi.iloc[-1]) and not pd.isna(vwap_hi.iloc[-2]):
@@ -311,6 +621,234 @@ def vwap_signal(df: pd.DataFrame) -> Dict[str, any]:
         'vwap_low': vwap_lo,
         'signal': sig
     }
+
+# ---------------------------
+# Order Block Filter
+# ---------------------------
+class ConfluenceFilter:
+    """Trend + Order Block + Volume filter sitting atop VWAP logic."""
+
+    def __init__(self, settings: Dict[str, any]):
+        self.s = settings
+        # Unified filter enable switch
+        self.enabled = bool(settings.get("UNIFIED_FILTER_ENABLED"))
+        self.ma_type = str(settings.get("OB_TREND_MA_TYPE", "HMA")).upper()
+        self.ma_len = int(settings.get("OB_TREND_MA_LEN", 55))
+        self.pivot_left = int(settings.get("OB_PIVOT_LEFT", 3))
+        self.pivot_right = int(settings.get("OB_PIVOT_RIGHT", 3))
+        self.lookback = int(settings.get("OB_LOOKBACK", 300))
+        self.zone_extend = int(settings.get("OB_ZONE_EXTEND_BARS", 500))
+        self.min_zone_mult = float(settings.get("OB_MIN_ZONE_SIZE_MULT", 0.25))
+        self.atr_len = int(settings.get("OB_ATR_LEN", 14))
+        self.mtf_enabled = bool(settings.get("OB_MTF_ENABLED"))
+        self.mtf_tf = settings.get("OB_MTF_TIMEFRAME", "1h")
+        self.entry_tol_pct = float(settings.get("OB_ENTRY_TOLERANCE_PCT", 0.15)) / 100.0
+        self.vol_lookback = int(settings.get("OB_VOLUME_LOOKBACK", 20))
+        self.vol_mult = float(settings.get("OB_VOLUME_MULT", 1.2))
+        self.zones: Dict[str, List[Dict]] = {}
+
+    # --- helpers ---
+    def _wma(self, series: pd.Series, length: int) -> pd.Series:
+        weights = np.arange(1, length + 1)
+        return series.rolling(length).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+    def _ma(self, series: pd.Series) -> pd.Series:
+        t = self.ma_type
+        l = self.ma_len
+        if t == "EMA":
+            return series.ewm(span=l, adjust=False).mean()
+        if t == "SMA":
+            return series.rolling(l).mean()
+        # default HMA
+        half = l // 2
+        sqrt_l = int(math.sqrt(l)) or 1
+        return self._wma(2 * self._wma(series, half) - self._wma(series, l), sqrt_l)
+
+    def _atr(self, df: pd.DataFrame) -> pd.Series:
+        high = df['high']; low = df['low']; close = df['close']
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
+        return tr.rolling(self.atr_len).mean()
+
+    def _pivot_highs(self, series: pd.Series) -> List[int]:
+        left = self.pivot_left; right = self.pivot_right
+        ph = []
+        for i in range(left, len(series) - right):
+            window = series.iloc[i - left:i + right + 1]
+            if series.iloc[i] == window.max():
+                ph.append(i)
+        return ph
+
+    def _pivot_lows(self, series: pd.Series) -> List[int]:
+        left = self.pivot_left; right = self.pivot_right
+        pl = []
+        for i in range(left, len(series) - right):
+            window = series.iloc[i - left:i + right + 1]
+            if series.iloc[i] == window.min():
+                pl.append(i)
+        return pl
+
+    def _update_zones(self, inst_key: str, df: pd.DataFrame) -> Tuple[bool, bool]:
+        zones = self.zones.setdefault(inst_key, [])
+        close = df['close']; open_ = df['open']; high = df['high']; low = df['low']
+        atr = self._atr(df)
+
+        # remove invalid or expired zones
+        last_close = close.iloc[-1]
+        for z in zones[:]:
+            age = len(df) - z['start_idx']
+            if age > self.zone_extend:
+                zones.remove(z); continue
+            if z['dir'] == 'bull' and last_close < z['low']:
+                zones.remove(z); continue
+            if z['dir'] == 'bear' and last_close > z['high']:
+                zones.remove(z); continue
+
+        lookback = min(self.lookback, len(df))
+        subset = df.tail(lookback)
+        offset = len(df) - len(subset)
+        ph = self._pivot_highs(subset['high'])
+        pl = self._pivot_lows(subset['low'])
+
+        ma = self._ma(close)
+        trend_up = ma.iloc[-1] > ma.iloc[-2] if len(ma) > 1 else False
+        trend_down = ma.iloc[-1] < ma.iloc[-2] if len(ma) > 1 else False
+
+        for idx in pl:
+            i = idx + offset
+            if not trend_up:
+                continue
+            j = i + 1
+            if j >= len(df):
+                continue
+            rng = abs(close.iloc[j] - open_.iloc[j])
+            atr_v = atr.iloc[j]
+            if close.iloc[j] > high.iloc[i] and rng > atr_v:
+                ob_idx = j - 1
+                if ob_idx < 0 or close.iloc[ob_idx] >= open_.iloc[ob_idx]:
+                    continue
+                lower = min(open_.iloc[ob_idx], close.iloc[ob_idx])
+                upper = max(open_.iloc[ob_idx], close.iloc[ob_idx])
+                if (upper - lower) < self.min_zone_mult * atr.iloc[ob_idx]:
+                    continue
+                zones.append({'dir': 'bull', 'low': lower, 'high': upper, 'start_idx': ob_idx})
+
+        for idx in ph:
+            i = idx + offset
+            if not trend_down:
+                continue
+            j = i + 1
+            if j >= len(df):
+                continue
+            rng = abs(close.iloc[j] - open_.iloc[j])
+            atr_v = atr.iloc[j]
+            if close.iloc[j] < low.iloc[i] and rng > atr_v:
+                ob_idx = j - 1
+                if ob_idx < 0 or close.iloc[ob_idx] <= open_.iloc[ob_idx]:
+                    continue
+                lower = min(open_.iloc[ob_idx], close.iloc[ob_idx])
+                upper = max(open_.iloc[ob_idx], close.iloc[ob_idx])
+                if (upper - lower) < self.min_zone_mult * atr.iloc[ob_idx]:
+                    continue
+                zones.append({'dir': 'bear', 'low': lower, 'high': upper, 'start_idx': ob_idx})
+
+        self.zones[inst_key] = zones
+        return trend_up, trend_down
+
+    def _allows_df(self, inst_key: str, df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
+        trend_up, trend_down = self._update_zones(inst_key, df)
+        price = df['close'].iloc[-1]
+        zones = self.zones.get(inst_key, [])
+        tol_ratio = self.entry_tol_pct
+        if direction == 'buy':
+            if not trend_up:
+                return False, 'trend_mismatch'
+            for z in zones:
+                if z['dir'] != 'bull':
+                    continue
+                tol = (z['high'] - z['low']) * tol_ratio
+                if price >= z['low'] - tol and price <= z['high'] + tol:
+                    break
+            else:
+                return False, 'not_in_OB_zone dir=bull'
+        else:
+            if not trend_down:
+                return False, 'trend_mismatch'
+            for z in zones:
+                if z['dir'] != 'bear':
+                    continue
+                tol = (z['high'] - z['low']) * tol_ratio
+                if price <= z['high'] + tol and price >= z['low'] - tol:
+                    break
+            else:
+                return False, 'not_in_OB_zone dir=bear'
+
+        avg_vol = df['volume'].tail(self.vol_lookback).mean()
+        last_vol = df['volume'].iloc[-1]
+        if last_vol < avg_vol * self.vol_mult:
+            return False, f"vol {last_vol:.0f} < {self.vol_mult}*avg({avg_vol:.0f})"
+        return True, 'ok'
+
+    def allows(self, inst: str, df: pd.DataFrame, direction: str) -> bool:
+        if not self.enabled:
+            return True
+        allowed, reason = self._allows_df(inst, df, direction)
+        if not allowed:
+            log(f"[FILTER] {inst} reject: {reason}")
+            return False
+        htf_flag = ""
+        if self.mtf_enabled:
+            try:
+                df_htf = get_candles_tf(self.s, inst_id=inst, timeframe=self.mtf_tf, limit=300)
+            except Exception:
+                log(f"[FILTER] {inst} reject: htf_fetch_fail")
+                return False
+            ok, _ = self._allows_df(inst + "|HTF", df_htf, direction)
+            if not ok:
+                log(f"[FILTER] {inst} reject: htf_mismatch")
+                return False
+            htf_flag = "+HTF"
+        log(f"[FILTER] {inst} allow dir={'buy' if direction=='buy' else 'sell'} (trend+OB+vol{htf_flag})")
+        return True
+
+# ---------------------------
+# Position Management
+# ---------------------------
+class PositionManager:
+    def __init__(self, settings: Dict[str, any], side: str, entry_price: float,
+                 qty: float, ct_val: float, stop_price: float, tp_price: float,
+                 atr: float, entry_time: str, entry_bar: int):
+        self.s = settings
+        self.side = side
+        self.entry_price = entry_price
+        self.qty = qty
+        self.ct_val = ct_val
+        self.stop_price = stop_price
+        self.tp_price = tp_price
+        self.initial_stop = abs(entry_price - stop_price)
+        self.atr = atr
+        self.entry_time = entry_time
+        self.entry_bar = entry_bar
+        self.entry_ordId = ''
+        self.fee_entry = 0.0
+        self.realized = 0.0
+        self.fees = 0.0
+        self.partial_done = False
+        self.be_moved = False
+
+    def update_stop(self, vwap_hi: float, vwap_lo: float, atr_now: float):
+        mult = self.s['VWAP_STOP_ATR_MULT']
+        if self.side == 'long':
+            self.stop_price = vwap_lo - mult * atr_now
+        else:
+            self.stop_price = vwap_hi + mult * atr_now
+        self.atr = atr_now
+
+    def r_multiple(self, price: float) -> float:
+        return abs(price - self.entry_price) / self.initial_stop if self.initial_stop>0 else 0.0
 
 # ---------------------------
 # Trading
@@ -338,7 +876,7 @@ def load_trade_history(path: str):
             rd = csv.DictReader(f)
             for row in rd:
                 try:
-                    pnl=float(row.get("pnl",0))
+                    pnl=float(row.get("pnl_net", row.get("pnl",0)))
                 except: pnl=0.0
                 inst=row.get("instrument","")
                 cum+=pnl; tot+=1; win+=1 if pnl>=0 else 0; loss+=1 if pnl<0 else 0
@@ -369,6 +907,27 @@ def load_bot_state(path: str) -> Optional[Dict]:
     except Exception:
         return None
 
+def load_progression_state(path: str, scope: str) -> Dict:
+    st = load_bot_state(path) or {}
+    prog = st.get("progression")
+    if not prog:
+        prog = {"scope": scope, "streaks": {}, "last_reset_ts": 0}
+        st["progression"] = prog
+        save_bot_state(path, st)
+    return prog
+
+def _prog_key(prog: Dict, symbol: str) -> str:
+    return "_global" if prog.get("scope", "global") == "global" else symbol
+
+def get_streak(prog: Dict, symbol: str) -> int:
+    return int(prog.get("streaks", {}).get(_prog_key(prog, symbol), 0))
+
+def set_streak(path: str, prog: Dict, symbol: str, val: int) -> None:
+    prog.setdefault("streaks", {})[_prog_key(prog, symbol)] = val
+    st = load_bot_state(path) or {}
+    st["progression"] = prog
+    save_bot_state(path, st)
+
 # ---------------------------
 # Main Loop
 # ---------------------------
@@ -378,60 +937,56 @@ def run_bot_vwap_only():
     history_file = s["TRADE_HISTORY_FILE"]
     state_file = s["STATE_FILE"]
 
-    instruments = s["INSTRUMENT_LIST"]
+    instruments, specs = build_top_usdt_universe(s)
     tf_list = sorted(parse_timeframes(s["TIMEFRAME"]), key=_tf_to_minutes)
-    # Use a single main TF (highest for stability)
     tf_main = tf_list[-1]
 
     cum, tot, win, loss, inst_stats = load_trade_history(history_file)
 
-    st = load_bot_state(state_file) or {}
-    current_instrument = st.get("current_instrument")
-    position_side = st.get("position_side")
-    entry_price = st.get("entry_price")
-    entry_size = st.get("entry_size")
-    tp_price = st.get("tp_price")
-    entry_ct_val = st.get("entry_ct_val")
-    entry_time = st.get("entry_time")
+    prog = load_progression_state(state_file, s.get("PROGRESSION_SCOPE", "global"))
+    current_instrument = None
+    position_side = None
+    entry_price = entry_size = tp_price = stop_price = entry_ct_val = entry_time = None
+    entry_bar = 0
+    entry_ordId = ""
+    fee_entry = 0.0
+    entry_fill_px = None
+    exec_qty = None
+    initial_stop_dist = 0.0
+    streak_before = 0
+    tp_pct = 0.0
+    sl_pct = 0.0
+    target_profit_usdt = 0.0
+    target_loss_usdt = 0.0
+    entry_dir = ''
+
+    cooldowns: Dict[str, float] = {}
+    leverage_set: set = set()
 
     start_msg = "🚀 تم تشغيل بوت OKX (استراتيجية VWAP Price Channel فقط)\n" +                 f"الإطار الزمني: {tf_main}\n" +                 f"عدد الأزواج: {len(instruments)}"
     log(start_msg); send_telegram(s, start_msg)
+    log(f"[START] VWAP mode={'donchian' if s['DC_MODE'] else 'pivots'} | OB Filter={'ON' if s['UNIFIED_FILTER_ENABLED'] else 'OFF'}")
+    scan_okx(s)
 
     last_report = now_utc()
     hour_trades=0; hour_profit=0.0; hour_wins=0; hour_losses=0
 
-    specs = prefetch_instrument_specs(s, instruments)
-    risk = float(s["RISK_PER_TRADE_PCT"])
-    daily_risk_pct = float(s["DAILY_RISK_PCT"])
     rr = float(s["REWARD_RISK_RATIO"])
-    fixed_capital = float(s.get("FIXED_CAPITAL_USDT", 0.0))
-
-    last_day = now_utc().date()
-    daily_loss = 0.0
+    margin_per_trade = float(s.get("MARGIN_PER_TRADE_USDT", 90.0))
+    confluence_filter = ConfluenceFilter(s)
 
     while True:
         try:
-            # Daily reset
-            today = now_utc().date()
-            if today != last_day:
-                daily_loss=0.0; last_day=today
-
-            # Check daily stop
             try:
                 bal = get_account_balance(s, 'USDT')
             except Exception:
                 bal = 0.0
-            if daily_risk_pct>0 and daily_loss >= bal*daily_risk_pct:
-                log("[DAILY LIMIT] تم الوصول إلى حد الخسارة اليومي")
-                send_telegram(s,"⚠️ تم الوصول إلى حد الخسارة اليومي")
-                time.sleep(60); continue
-
-            # Base capital for sizing: fixed (if >0) else balance
-            base_capital = fixed_capital if fixed_capital>0 else bal
 
             if position_side is None:
                 opened=False
                 for inst in instruments:
+                    if inst in cooldowns and time.time() - cooldowns[inst] < s['COOLDOWN_SEC']:
+                        continue
                     # Fetch data
                     try:
                         df = get_candles_tf(s, inst_id=inst, timeframe=tf_main, limit=300)
@@ -439,7 +994,7 @@ def run_bot_vwap_only():
                         log(f"[SKIP] فشل الحصول على البيانات للزوج {inst} ({tf_main}): {ex}")
                         continue
 
-                    sig = vwap_signal(df)
+                    sig = vwap_signal(df, s)
                     trend = sig['trend']
                     vwap_hi = sig['vwap_high']
                     vwap_lo = sig['vwap_low']
@@ -447,82 +1002,234 @@ def run_bot_vwap_only():
                     if direction is None or trend is None:
                         continue
 
-                    price = df['close'].iloc[-1]
-                    lot, ct = specs.get(inst,(1.0,1.0))
-
-                    # Determine active stop (trailing at active anchored VWAP) & initial stop distance
-                    if direction=='buy' and trend=='up':
-                        active_stop = vwap_lo.iloc[-1]  # active VWAP is from last swing low
-                    elif direction=='sell' and trend=='down':
-                        active_stop = vwap_hi.iloc[-1]  # active VWAP is from last swing high
-                    else:
-                        # Ignore mixed cases (shouldn't happen with logic above)
+                    if not confluence_filter.allows(inst, df, direction):
                         continue
 
-                    if pd.isna(active_stop):
+                    spec = specs.get(inst)
+                    if not spec:
                         continue
+                    ct = spec['ctVal']; lot = spec['lotSz']; min_sz = spec['minSz']; prec = spec['szPrec']; px_prec = spec.get('pxPrec',4)
 
-                    stop_dist = abs(price - active_stop)
-                    if stop_dist<=0:
+                    # --- Price guard ---
+                    last_close = df['close'].iloc[-1]
+                    price = compute_safe_price(s, inst, last_close, px_prec) if s.get("STRICT_PRICE_GUARD", True) else round(last_close, px_prec)
+                    if price is None or price <= 0:
+                        log(f"[FILTER] {inst} reject: bad_price (price<=0)")
                         continue
+                    if s.get("PRICE_SPIKE_GUARD", True):
+                        tol = float(s.get("SPIKE_GUARD_TOLERANCE", 0.10))
+                        if last_close > 0 and abs(price/last_close - 1.0) > tol:
+                            log(f"[FILTER] {inst} reject: price_spike_guard")
+                            continue
 
-                    # Position sizing by risk
-                    risk_amount = base_capital * risk
-                    contracts_raw = risk_amount / (stop_dist * ct)
-                    lot = lot if lot and lot>0 else 1.0
-                    units_int = max(1, int(contracts_raw / lot))
-                    contracts = units_int * lot
-                    size_str = f"{contracts:.8f}".rstrip('0').rstrip('.')
-                    notional = price * contracts * ct
-                    lev=10
-                    margin = notional/lev
-
-                    # Place entry
-                    side = 'buy' if direction=='buy' else 'sell'
+                    # --- Enforce leverage per-instrument once ---
+                    lev_eff = float(s["LEVERAGE"])
                     try:
-                        response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=lev, td_mode='cross', ord_type='market')
-                    except Exception as ex:
-                        log(f"[ORDER_ERROR] {ex}")
+                        if inst not in leverage_set:
+                            set_leverage(s, inst, s["TD_MODE"], int(s["LEVERAGE"]), s.get("POS_MODE","net"))
+                            leverage_set.add(inst)
+                        info = get_leverage_info(s, inst, s["TD_MODE"])
+                        lev_eff = float(info["data"][0]["lever"])
+                        log(f"[LEV] {inst} effective_leverage={lev_eff}")
+                    except Exception as e:
+                        log(f"[LEV_WARN] {inst} leverage set/check failed: {e}")
+
+                    # Position sizing by fixed margin with precheck
+                    notional_target = margin_per_trade * lev_eff
+                    contracts_raw   = notional_target / (price * ct)
+                    qty = math.floor(contracts_raw / lot) * lot
+                    if qty < min_sz:
+                        if s["AUTO_ADJUST_MARGIN"]:
+                            qty = min_sz
+                        else:
+                            continue
+                    notional = qty * price * ct
+                    fee_buffer     = notional * s["FEE_RATE"] * s.get("FEE_BUFFER_MULT", 0.0)
+                    required_margin= notional / lev_eff + fee_buffer
+                    log(f"[SIZING] price={price:.{px_prec}f} ctVal={ct} lotSz={lot} minSz={min_sz} contracts_raw={contracts_raw:.4f} qty_final={qty}")
+                    safety       = float(s.get("MARGIN_SAFETY_FRACTION", 0.95))
+                    max_notional = bal * lev_eff * safety
+                    if notional > max_notional:
+                        qty_cap = math.floor((max_notional / (price * ct)) / lot) * lot
+                        if qty_cap < min_sz:
+                            log(f"[FILTER] {inst} reject: qty_below_min after margin cap")
+                            continue
+                        qty      = qty_cap
+                        notional = qty * price * ct
+                        fee_buffer      = notional * s["FEE_RATE"] * s.get("FEE_BUFFER_MULT", 0.0)
+                        required_margin = notional / lev_eff + fee_buffer
+                    if bal < required_margin:
+                        log(f"[PRECHECK_FAIL] avail={bal:.2f} required={required_margin:.2f} notional={notional:.2f} qty={qty} lev_eff={lev_eff}")
                         continue
+                    size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
+                    margin = notional / lev_eff
+
+                    entry_dir = 'long' if direction=='buy' else 'short'
+                    basis = s.get('PROGRESSION_BASIS', 'margin')
+                    if s['PROGRESSION_ENABLED']:
+                        streak_before = get_streak(prog, inst)
+                        L_eff = min(streak_before, s['MAX_PROGRESSION_STEPS'])
+                        base_tp = s['BASE_TP_PCT_ON_MARGIN']
+                        base_sl = s['BASE_SL_PCT_ON_MARGIN']
+                        tp_pct = base_tp * (2 ** L_eff)
+                        sl_pct = base_sl * (2 ** max(L_eff - 1, 0))
+                        margin_usdt = margin_per_trade
+                        target_profit_usdt = tp_pct * margin_usdt
+                        target_loss_usdt = sl_pct * margin_usdt
+                        basis = s.get('PROGRESSION_BASIS', 'margin')
+                        if basis == 'price':
+                            delta_tp_pre = price * tp_pct
+                            delta_sl_pre = price * sl_pct
+                        else:
+                            delta_tp_pre = target_profit_usdt / (qty * ct)
+                            delta_sl_pre = target_loss_usdt / (qty * ct)
+                        atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
+                        if entry_dir == 'long':
+                            tp_price = round(price + delta_tp_pre, px_prec)
+                            sl_price = round(price - delta_sl_pre, px_prec)
+                            initial_stop_dist = price - sl_price
+                        else:
+                            tp_price = round(price - delta_tp_pre, px_prec)
+                            sl_price = round(price + delta_sl_pre, px_prec)
+                            initial_stop_dist = sl_price - price
+                        if initial_stop_dist < s['MIN_STOP_ATR'] * atr_now:
+                            continue
+                        active_stop = sl_price
+                        log(f"[PROGRESSION] scope={prog.get('scope','global')} L={L_eff} -> TP={tp_pct*100:.2f}% SL={sl_pct*100:.2f}% on margin={margin_usdt:.2f} (target +{target_profit_usdt:.2f}/-{target_loss_usdt:.2f} USDT)")
+                    else:
+                        atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
+                        if entry_dir == 'long':
+                            active_stop = vwap_lo.iloc[-1] - s['VWAP_STOP_ATR_MULT']*atr_now
+                            initial_stop_dist = price - active_stop
+                            tp_price = price + initial_stop_dist*rr
+                        else:
+                            active_stop = vwap_hi.iloc[-1] + s['VWAP_STOP_ATR_MULT']*atr_now
+                            initial_stop_dist = active_stop - price
+                            tp_price = price - initial_stop_dist*rr
+                        if pd.isna(active_stop) or initial_stop_dist <= 0:
+                            continue
+                        if initial_stop_dist < s['MIN_STOP_ATR']*atr_now:
+                            continue
+                        tp_pct = sl_pct = 0.0
+                        streak_before = 0
+                        target_profit_usdt = target_loss_usdt = 0.0
+
+                    side = 'buy' if direction=='buy' else 'sell'
+                    attempts = 0
+                    max_attempts = 8
+                    response = None
+                    while attempts < max_attempts:
+                        try:
+                            response = place_order(
+                                s, side=side, size=size_str, inst_id=inst,
+                                leverage=s['LEVERAGE'], td_mode=s['TD_MODE'], ord_type='market'
+                            )
+                            break
+                        except Exception as ex:
+                            msg = str(ex)
+                            if '51202' in msg and qty > min_sz:
+                                new_qty = math.floor(max(min_sz, qty * s.get("SIZE_REDUCTION_FACTOR",0.80)) / lot) * lot
+                                if new_qty == qty:
+                                    new_qty = max(min_sz, qty - lot)
+                                qty = new_qty
+                                size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
+                                log(f"[RETRY] {inst} reducing qty to {size_str} due to 51202")
+                                attempts += 1
+                                continue
+                            if '51008' in msg:
+                                if s.get("DISABLE_SHRINK_ON_51008", True):
+                                    log("[RETRY] 51008 with fixed sizing policy -> abort this symbol this cycle")
+                                    response = None
+                                    break
+                                new_qty = math.floor(max(min_sz, qty * s.get("SIZE_REDUCTION_FACTOR",0.80)) / lot) * lot
+                                if new_qty == qty:
+                                    new_qty = max(min_sz, qty - lot)
+                                qty = new_qty
+                                size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
+                                log(f"[RETRY] {inst} reducing qty to {size_str} due to 51008")
+                                attempts += 1
+                                continue
+                            log(f"[ORDER_ERROR] {ex}")
+                            break
+                    if response is None:
+                        continue
+
+                    try:
+                        od = response.get('data', [])[0]
+                        entry_ordId = od.get('ordId', '')
+                        log(f"[ORDER_RESPONSE] code={response.get('code')} sCode={od.get('sCode')} sMsg={od.get('sMsg')} ordId={entry_ordId}")
+                    except Exception:
+                        entry_ordId = ''
+                        log(f"[ORDER_RESPONSE] {response}")
+
+                    fill=None
+                    for _ in range(3):
+                        fill = get_order_fill(s, inst, entry_ordId)
+                        if fill: break
+                        time.sleep(1)
+                    if fill:
+                        entry_fill_px = fill['fillPx']
+                        exec_qty = fill['fillSz']
+                        fee_entry = abs(fill.get('fee', 0.0))
+                    else:
+                        entry_fill_px = price
+                        exec_qty = qty
+                        fee_entry = s['FEE_RATE'] * entry_fill_px * exec_qty * ct
 
                     current_instrument = inst
                     position_side = 'long' if direction=='buy' else 'short'
-                    entry_price = price; entry_size = size_str
-                    entry_ct_val = ct; entry_time = now_utc().isoformat()
+                    entry_price = entry_fill_px
+                    entry_size = size_str
+                    entry_ct_val = ct
+                    entry_time = now_utc().isoformat()
+                    notional = exec_qty * entry_price * ct
+                    margin = notional / lev_eff
 
-                    # Fixed TP based on initial stop distance
-                    tp_price = (entry_price + stop_dist*rr) if position_side=='long' else (entry_price - stop_dist*rr)
-
-                    save_bot_state(state_file, {
-                        'current_instrument': current_instrument,
-                        'position_side': position_side,
-                        'entry_price': entry_price,
-                        'entry_size': entry_size,
-                        'tp_price': tp_price,
-                        'entry_ct_val': entry_ct_val,
-                        'entry_time': entry_time
-                    })
-
-                    try:
-                        od=response.get('data',[])[0]
-                        log(f"[ORDER_RESPONSE] code={response.get('code')} sCode={od.get('sCode')} sMsg={od.get('sMsg')} ordId={od.get('ordId')}")
-                    except Exception:
-                        log(f"[ORDER_RESPONSE] {response}")
+                    if s['PROGRESSION_ENABLED']:
+                        basis = s.get('PROGRESSION_BASIS', 'margin')
+                        if basis == 'price':
+                            delta_tp = entry_price * tp_pct
+                            delta_sl = entry_price * sl_pct
+                        else:
+                            delta_tp = target_profit_usdt / (exec_qty * ct)
+                            delta_sl = target_loss_usdt / (exec_qty * ct)
+                        if position_side == 'long':
+                            tp_price = round(entry_price + delta_tp, px_prec)
+                            sl_price = round(entry_price - delta_sl, px_prec)
+                        else:
+                            tp_price = round(entry_price - delta_tp, px_prec)
+                            sl_price = round(entry_price + delta_sl, px_prec)
+                        active_stop = sl_price
+                        initial_stop_dist = abs(entry_price - active_stop)
+                    stop_price = active_stop
+                    
                     try:
                         balance_after = get_account_balance(s,'USDT')
                     except Exception:
                         balance_after = bal
 
-                    entry_dir = 'شراء' if position_side=='long' else 'بيع'
-                    send_telegram(s,
-                        ( "📈" if position_side=='long' else "📉" ) +
-                        f" دخول صفقة {entry_dir} على <b>{inst}</b>\n"
-                        f"TF: {tf_main}\n"
-                        f"القيمة الإسمية: {notional:.2f} | الهامش: {margin:.2f} | الرصيد: {balance_after:.2f}\n"
-                        f"الكمية: {entry_size} | سعر الدخول: {entry_price:.4f}\n"
-                        f"⏫ TP: {tp_price:.4f} | ⏬ وقف متغير: Anchored VWAP ({'low' if position_side=='long' else 'high'})"
-                    )
-                    log(f"[ENTRY] {entry_dir} {inst}: qty {entry_size}, px {entry_price:.4f}")
+                    if not s['PROGRESSION_ENABLED']:
+                        dir_txt = 'شراء' if position_side=='long' else 'بيع'
+                        send_telegram(
+                            s,
+                            ("📈" if position_side=='long' else "📉") +
+                            f" دخول صفقة {dir_txt} على <b>{inst}</b>\n"
+                            f"TF: {tf_main}\n"
+                        f"الكمية: {exec_qty} | سعر الدخول (fill): {entry_price:.{px_prec}f}\n"
+                        f"الهامش: {margin:.2f} | النوتيونال: {notional:.2f} | الرافعة: {lev_eff:.0f}x\n"
+                        f"SL (مبدئي/فعّال): {active_stop:.{px_prec}f} | TP: {tp_price:.{px_prec}f}\n"
+                            f"ordId: {entry_ordId}"
+                        )
+                    else:
+                        send_telegram(
+                            s,
+                            f"[ENTRY] {inst} {entry_dir.upper()} qty={exec_qty} @ {entry_price:.{px_prec}f}\n"
+                            f"TP={tp_price:.{px_prec}f} ({tp_pct*100:.2f}%) | SL={active_stop:.{px_prec}f} ({sl_pct*100:.2f}%)\n"
+                            f"basis={basis} | targets: +{target_profit_usdt:.2f}/-{target_loss_usdt:.2f} USDT\n"
+                            f"L={streak_before} | scope={prog.get('scope','global')}"
+                        )
+                    log(f"[ENTRY] {entry_dir} {inst}: qty {exec_qty}, px {entry_price:.{px_prec}f}")
+                    entry_bar = len(df)
                     opened=True
                     break
 
@@ -538,69 +1245,170 @@ def run_bot_vwap_only():
                     log(f"[ERROR] فشل جلب البيانات للزوج {current_instrument}: {ex}")
                     time.sleep(60); continue
 
-                sig = vwap_signal(df)
+                sig = vwap_signal(df, s)
                 vwap_hi = sig['vwap_high']
                 vwap_lo = sig['vwap_low']
 
-                current_price = df['close'].iloc[-1]
-                # Dynamic stop recalculated each loop
-                if position_side=='long':
-                    active_stop = vwap_lo.iloc[-1]
-                    tp_hit = current_price >= tp_price if tp_price is not None else False
-                    sl_hit = (not pd.isna(active_stop)) and (current_price <= active_stop)
-                else:
-                    active_stop = vwap_hi.iloc[-1]
-                    tp_hit = current_price <= tp_price if tp_price is not None else False
-                    sl_hit = (not pd.isna(active_stop)) and (current_price >= active_stop)
+                last_close = df['close'].iloc[-1]
+                px_prec_pm = specs.get(current_instrument, {}).get('pxPrec', 4)
+                current_price = compute_safe_price(s, current_instrument, last_close, px_prec_pm) or last_close
+                atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
 
+                if s['PROGRESSION_ENABLED']:
+                    active_stop = stop_price
+                    if position_side == 'long':
+                        tp_hit = current_price >= tp_price
+                        sl_hit = current_price <= active_stop
+                    else:
+                        tp_hit = current_price <= tp_price
+                        sl_hit = current_price >= active_stop
+                    if s['MIN_HOLD_BARS'] > 0:
+                        hold_bars = len(df) - int(entry_bar or 0)
+                        if hold_bars < s['MIN_HOLD_BARS']:
+                            sl_hit = False
+                else:
+                    close_prev = df['close'].iloc[-2]
+                    atr_prev = calc_atr(df, s['OB_ATR_LEN']).iloc[-2]
+                    gap = abs(current_price - close_prev)
+                    mult = s['VWAP_STOP_ATR_MULT']
+                    if position_side=='long':
+                        active_stop = vwap_lo.iloc[-1] - mult*atr_now
+                        stop_prev = vwap_lo.iloc[-2] - mult*atr_prev
+                        tp_hit = current_price >= tp_price if tp_price is not None else False
+                        sl_confirm = (current_price < active_stop) and (close_prev >= stop_prev)
+                        gap_exit = gap > atr_now and current_price < active_stop
+                    else:
+                        active_stop = vwap_hi.iloc[-1] + mult*atr_now
+                        stop_prev = vwap_hi.iloc[-2] + mult*atr_prev
+                        tp_hit = current_price <= tp_price if tp_price is not None else False
+                        sl_confirm = (current_price > active_stop) and (close_prev <= stop_prev)
+                        gap_exit = gap > atr_now and current_price > active_stop
+
+                    hold_bars = len(df) - int(entry_bar or 0)
+                    if hold_bars < s['MIN_HOLD_BARS'] and not gap_exit:
+                        sl_confirm = False
+                    sl_hit = gap_exit or sl_confirm
+
+                log(f"[PM] price={current_price:.{px_prec_pm}f} atr={atr_now:.4f} stop={active_stop:.{px_prec_pm}f} tp={tp_price:.{px_prec_pm}f}")
+    
                 if tp_hit or sl_hit:
-                    px = current_price
                     closing_side = 'sell' if position_side=='long' else 'buy'
+                    qty_close = float(exec_qty or entry_size)
+                    prec = specs.get(current_instrument, {}).get('szPrec', 0)
+                    size_close = f"{qty_close:.{prec}f}".rstrip('0').rstrip('.')
                     try:
-                        response = place_order(s, side=closing_side, size=entry_size, inst_id=current_instrument, leverage=10, td_mode='cross', ord_type='market')
+                        response = place_order(s, side=closing_side, size=size_close, inst_id=current_instrument, leverage=s['LEVERAGE'], td_mode=s['TD_MODE'], ord_type='market')
                     except Exception as ex:
                         log(f"[ORDER_CLOSE_ERROR] {ex}")
                         time.sleep(60); continue
-
+    
+                    try:
+                        od = response.get('data', [])[0]
+                        exit_ordId = od.get('ordId', '')
+                    except Exception:
+                        exit_ordId = ''
+    
+                    fill=None
+                    for _ in range(3):
+                        fill = get_order_fill(s, current_instrument, exit_ordId)
+                        if fill: break
+                        time.sleep(1)
+                    if fill:
+                        exit_fill_px = fill['fillPx']
+                        fee_exit = abs(fill.get('fee', 0.0))
+                    else:
+                        exit_fill_px = current_price
+                        fee_exit = s['FEE_RATE'] * exit_fill_px * qty_close * (entry_ct_val or 1.0)
+    
                     ct = entry_ct_val if entry_ct_val and entry_ct_val>0 else 1.0
-                    qty = float(entry_size)
-                    gross = (px - entry_price)*qty*ct if position_side=='long' else (entry_price - px)*qty*ct
-                    fee_rate = float(s.get('FEE_RATE',0.0006))
-                    entry_notional = entry_price*qty*ct; exit_notional = px*qty*ct
-                    fees = fee_rate*(entry_notional + exit_notional)
-                    pnl = gross - fees
-                    cum += pnl; tot += 1
-                    if pnl>=0: win += 1
-                    else: loss += 1; daily_loss += -pnl
-                    hour_trades += 1; hour_profit += pnl
-                    if pnl>=0: hour_wins += 1
+                    gross = (exit_fill_px - entry_price)*qty_close*ct if position_side=='long' else (entry_price - exit_fill_px)*qty_close*ct
+                    fees = fee_entry + fee_exit
+                    pnl_net = gross - fees
+                    cum += pnl_net; tot += 1
+                    if pnl_net>=0: win += 1
+                    else: loss += 1
+                    if s['PROGRESSION_ENABLED']:
+                        L_before = streak_before
+                        if pnl_net > 0:
+                            L_after = 0
+                        elif pnl_net < 0:
+                            L_after = min(L_before + 1, s['MAX_PROGRESSION_STEPS'])
+                        else:
+                            L_after = L_before
+                        set_streak(state_file, prog, current_instrument, L_after)
+                    else:
+                        L_before = 0
+                        L_after = 0
+                    hour_trades += 1; hour_profit += pnl_net
+                    if pnl_net>=0: hour_wins += 1
                     else: hour_losses += 1
 
                     exit_time = now_utc().isoformat()
-                    reason = "تحقيق الهدف" if tp_hit else "كسر Anchored VWAP (وقف متحرك)"
+                    hold_sec = int((now_utc() - datetime.fromisoformat(entry_time)).total_seconds()) if entry_time else 0
+                    r_realized = abs((exit_fill_px - entry_price) / initial_stop_dist) if initial_stop_dist>0 else 0.0
+                    reason = "TP" if tp_hit else ("SL-gap" if ('gap_exit' in locals() and gap_exit) else "SL-confirm")
+    
                     rec = {
-                        'timestamp_entry': entry_time, 'timestamp_exit': exit_time,
-                        'instrument': current_instrument, 'side': position_side,
-                        'entry_price': entry_price, 'exit_price': px,
-                        'contracts': entry_size, 'ct_val': entry_ct_val,
-                        'gross_pnl': gross, 'fees': fees, 'pnl': pnl
+                        'timestamp_entry': entry_time,
+                        'timestamp_exit': exit_time,
+                        'tf': tf_main,
+                        'instrument': current_instrument,
+                        'side': position_side,
+                        'entry_ordId': entry_ordId,
+                        'exit_ordId': exit_ordId,
+                        'entry_fill_px': entry_price,
+                        'exit_fill_px': exit_fill_px,
+                        'exec_qty': qty_close,
+                        'ct_val': entry_ct_val,
+                        'initial_stop': initial_stop_dist,
+                        'exit_reason': reason,
+                        'gross_pnl': gross,
+                        'fees': fees,
+                        'pnl_net': pnl_net,
+                        'r_realized': r_realized,
+                        'hold_bars': hold_bars,
+                        'hold_time_sec': hold_sec,
+                        'notional_entry': entry_price * qty_close * (entry_ct_val or 1.0),
+                        'notional_exit': exit_fill_px * qty_close * (entry_ct_val or 1.0),
+                        'leverage': lev_eff,
+                        'tp_on_margin_pct': tp_pct,
+                        'sl_on_margin_pct': sl_pct,
+                        'tp_price': tp_price,
+                        'sl_price': active_stop,
+                        'target_profit_usdt': target_profit_usdt,
+                        'target_loss_usdt': target_loss_usdt,
+                        'streak_before': L_before,
+                        'streak_after': L_after,
                     }
                     append_trade_record(history_file, rec)
-                    try:
-                        if os.path.isfile(state_file): os.remove(state_file)
-                    except Exception: pass
-
-                    profit_text = "ربح" if pnl>=0 else "خسارة"
-                    send_telegram(s,
-                        f"✅ إغلاق صفقة {('شراء' if position_side=='long' else 'بيع')} على <b>{current_instrument}</b>\n"
-                        f"سبب الخروج: {reason}\n"
-                        f"سعر الخروج: {px:.4f} USDT\n"
-                        f"نتيجة الصفقة: {profit_text} {abs(pnl):.4f} USDT\n"
-                        f"الإجمالي حتى الآن: {cum:.4f} USDT")
-                    log(f"[EXIT] {('شراء' if position_side=='long' else 'بيع')} {current_instrument}: px {px:.4f}, PnL {pnl:.4f}")
-
-                    current_instrument=None; position_side=None
+    
+                    if s['PROGRESSION_ENABLED']:
+                        hit = 'TP' if tp_hit else ('SL-gap' if ('gap_exit' in locals() and gap_exit) else 'SL')
+                        send_telegram(
+                            s,
+                            f"[EXIT] {current_instrument} {hit} {entry_dir}\n"
+                            f"in={entry_price:.{px_prec_pm}f} out={exit_fill_px:.{px_prec_pm}f} qty={qty_close}\n"
+                            f"PnL_net={pnl_net:.2f} USDT | fees={fees:.2f}\n"
+                            f"L(before close)={L_before} -> L(after close)={L_after}"
+                        )
+                    else:
+                        send_telegram(
+                            s,
+                            f"✅ إغلاق {('شراء' if position_side=='long' else 'بيع')} <b>{current_instrument}</b> — {reason}\n"
+                            f"سعر الخروج (fill): {exit_fill_px:.{px_prec_pm}f}\n"
+                            f"SL/TP عند الخروج: SL={active_stop:.{px_prec_pm}f} | TP={tp_price:.{px_prec_pm}f}\n"
+                            f"PnL: {fmt_signed(pnl_net)} USDT  |  G:{fmt_signed(gross)}  F:{fees:.4f}\n"
+                            f"R-realized: {r_realized:.2f}R  |  مدة الاحتفاظ: {hold_bars} بار / {hold_sec}s\n"
+                            f"ordId(entry): {entry_ordId} | ordId(exit): {exit_ordId}\n"
+                            f"الإجمالي: {cum:.4f} USDT"
+                        )
+                    log(f"[EXIT] {('شراء' if position_side=='long' else 'بيع')} {current_instrument}: px {exit_fill_px:.{px_prec_pm}f}, PnL {pnl_net:.4f}")
+    
+                    current_instrument=None; position_side=None; entry_dir=''
                     entry_price=entry_size=tp_price=entry_ct_val=entry_time=None
+                    stop_price=None; streak_before=0
+                    tp_pct=0.0; sl_pct=0.0
+                    target_profit_usdt=0.0; target_loss_usdt=0.0
 
             # Hourly report
             now = now_utc()

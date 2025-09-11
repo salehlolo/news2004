@@ -1182,6 +1182,7 @@ def run_bot_vwap_only():
                 gap = abs(current_price - close_prev)
 
                 if s['PROGRESSION_ENABLED']:
+                    # احتفظ بمنطق تأكيد الإغلاق عبر إقفال الشمعة أو فجوة سعرية
                     active_stop = stop_price
                     tp_hit = current_price >= tp_price if position_side=='long' else current_price <= tp_price
                     if position_side=='long':

@@ -1216,7 +1216,6 @@ def run_bot_vwap_only():
                     sl_confirm = False
 
                 sl_hit = gap_exit or sl_confirm
-
             px_prec_pm = specs.get(current_instrument, {}).get('pxPrec', 4)
             log(f"[PM] price={current_price:.{px_prec_pm}f} atr={atr_now:.4f} stop={active_stop:.{px_prec_pm}f} tp={tp_price:.{px_prec_pm}f}")
 

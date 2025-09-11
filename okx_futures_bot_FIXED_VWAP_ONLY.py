@@ -187,8 +187,8 @@ def load_settings() -> Dict[str, any]:
     s["BASE_TP_PCT_ON_MARGIN"] = _f("BASE_TP_PCT_ON_MARGIN", 0.01)
     s["BASE_SL_PCT_ON_MARGIN"] = _f("BASE_SL_PCT_ON_MARGIN", 0.01)
     s["MAX_PROGRESSION_STEPS"] = _i("MAX_PROGRESSION_STEPS", 6)
-    # Profit targets always exclude fees; key kept for backward compatibility only.
-    s["INCLUDE_FEES_IN_TARGET"] = False
+    s["PROGRESSION_BASIS"] = os.getenv("PROGRESSION_BASIS", "margin").lower()
+    s["INCLUDE_FEES_IN_TARGET"] = _b("INCLUDE_FEES_IN_TARGET", False)
     s["MARGIN_SAFETY_FRACTION"] = _f("MARGIN_SAFETY_FRACTION", 0.95)
     if s["PROGRESSION_ENABLED"]:
         s["PARTIAL_TP_ENABLED"] = False
@@ -1027,6 +1027,7 @@ def run_bot_vwap_only():
                     margin = notional / s["LEVERAGE"]
 
                     entry_dir = 'long' if direction=='buy' else 'short'
+                    basis = s.get('PROGRESSION_BASIS', 'margin')
                     if s['PROGRESSION_ENABLED']:
                         streak_before = get_streak(prog, inst)
                         L_eff = min(streak_before, s['MAX_PROGRESSION_STEPS'])
@@ -1037,19 +1038,25 @@ def run_bot_vwap_only():
                         margin_usdt = margin_per_trade
                         target_profit_usdt = tp_pct * margin_usdt
                         target_loss_usdt = sl_pct * margin_usdt
-                        delta_tp_pre = target_profit_usdt / (qty * ct)
-                        delta_sl_pre = target_loss_usdt / (qty * ct)
+                        basis = s.get('PROGRESSION_BASIS', 'margin')
+                        if basis == 'price':
+                            delta_tp_pre = price * tp_pct
+                            delta_sl_pre = price * sl_pct
+                        else:
+                            delta_tp_pre = target_profit_usdt / (qty * ct)
+                            delta_sl_pre = target_loss_usdt / (qty * ct)
                         atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
                         if entry_dir == 'long':
                             tp_price = round(price + delta_tp_pre, px_prec)
-                            active_stop = round(price - delta_sl_pre, px_prec)
-                            initial_stop_dist = price - active_stop
+                            sl_price = round(price - delta_sl_pre, px_prec)
+                            initial_stop_dist = price - sl_price
                         else:
                             tp_price = round(price - delta_tp_pre, px_prec)
-                            active_stop = round(price + delta_sl_pre, px_prec)
-                            initial_stop_dist = active_stop - price
+                            sl_price = round(price + delta_sl_pre, px_prec)
+                            initial_stop_dist = sl_price - price
                         if initial_stop_dist < s['MIN_STOP_ATR'] * atr_now:
                             continue
+                        active_stop = sl_price
                         log(f"[PROGRESSION] scope={prog.get('scope','global')} L={L_eff} -> TP={tp_pct*100:.2f}% SL={sl_pct*100:.2f}% on margin={margin_usdt:.2f} (target +{target_profit_usdt:.2f}/-{target_loss_usdt:.2f} USDT)")
                     else:
                         atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
@@ -1119,14 +1126,20 @@ def run_bot_vwap_only():
                     margin = notional / s['LEVERAGE']
 
                     if s['PROGRESSION_ENABLED']:
-                        delta_tp = target_profit_usdt / (exec_qty * ct)
-                        delta_sl = target_loss_usdt / (exec_qty * ct)
+                        basis = s.get('PROGRESSION_BASIS', 'margin')
+                        if basis == 'price':
+                            delta_tp = entry_price * tp_pct
+                            delta_sl = entry_price * sl_pct
+                        else:
+                            delta_tp = target_profit_usdt / (exec_qty * ct)
+                            delta_sl = target_loss_usdt / (exec_qty * ct)
                         if position_side == 'long':
                             tp_price = round(entry_price + delta_tp, px_prec)
-                            active_stop = round(entry_price - delta_sl, px_prec)
+                            sl_price = round(entry_price - delta_sl, px_prec)
                         else:
                             tp_price = round(entry_price - delta_tp, px_prec)
-                            active_stop = round(entry_price + delta_sl, px_prec)
+                            sl_price = round(entry_price + delta_sl, px_prec)
+                        active_stop = sl_price
                         initial_stop_dist = abs(entry_price - active_stop)
                     stop_price = active_stop
                     
@@ -1150,10 +1163,10 @@ def run_bot_vwap_only():
                     else:
                         send_telegram(
                             s,
-                        f"[ENTRY] {inst} {entry_dir.upper()} qty={exec_qty} @ {entry_price:.{px_prec}f}\n"
-                        f"TP={tp_price:.{px_prec}f} (+{target_profit_usdt:.2f} USDT on margin)\n"
-                        f"SL={active_stop:.{px_prec}f} (-{target_loss_usdt:.2f} USDT on margin)\n"
-                            f"L={streak_before} | TP%={tp_pct*100:.2f} SL%={sl_pct*100:.2f} | scope={prog.get('scope','global')}"
+                            f"[ENTRY] {inst} {entry_dir.upper()} qty={exec_qty} @ {entry_price:.{px_prec}f}\n"
+                            f"TP={tp_price:.{px_prec}f} ({tp_pct*100:.2f}%) | SL={active_stop:.{px_prec}f} ({sl_pct*100:.2f}%)\n"
+                            f"basis={basis} | targets: +{target_profit_usdt:.2f}/-{target_loss_usdt:.2f} USDT\n"
+                            f"L={streak_before} | scope={prog.get('scope','global')}"
                         )
                     log(f"[ENTRY] {entry_dir} {inst}: qty {exec_qty}, px {entry_price:.{px_prec}f}")
                     entry_bar = len(df)
@@ -1176,25 +1189,27 @@ def run_bot_vwap_only():
                 vwap_hi = sig['vwap_high']
                 vwap_lo = sig['vwap_low']
 
-                current_price = df['close'].iloc[-1]
-                close_prev = df['close'].iloc[-2]
+                last_close = df['close'].iloc[-1]
+                px_prec_pm = specs.get(current_instrument, {}).get('pxPrec', 4)
+                current_price = compute_safe_price(s, current_instrument, last_close, px_prec_pm) or last_close
                 atr_now = calc_atr(df, s['OB_ATR_LEN']).iloc[-1]
-                gap = abs(current_price - close_prev)
 
                 if s['PROGRESSION_ENABLED']:
-                    # احتفظ بمنطق تأكيد الإغلاق عبر إقفال الشمعة أو فجوة سعرية
                     active_stop = stop_price
-                    tp_hit = current_price >= tp_price if position_side=='long' else current_price <= tp_price
-                    if position_side=='long':
-                        stop_prev = active_stop
-                        sl_confirm = (current_price < active_stop) and (close_prev >= active_stop)
-                        gap_exit = gap > atr_now and current_price < active_stop
+                    if position_side == 'long':
+                        tp_hit = current_price >= tp_price
+                        sl_hit = current_price <= active_stop
                     else:
-                        stop_prev = active_stop
-                        sl_confirm = (current_price > active_stop) and (close_prev <= active_stop)
-                        gap_exit = gap > atr_now and current_price > active_stop
+                        tp_hit = current_price <= tp_price
+                        sl_hit = current_price >= active_stop
+                    if s['MIN_HOLD_BARS'] > 0:
+                        hold_bars = len(df) - int(entry_bar or 0)
+                        if hold_bars < s['MIN_HOLD_BARS']:
+                            sl_hit = False
                 else:
+                    close_prev = df['close'].iloc[-2]
                     atr_prev = calc_atr(df, s['OB_ATR_LEN']).iloc[-2]
+                    gap = abs(current_price - close_prev)
                     mult = s['VWAP_STOP_ATR_MULT']
                     if position_side=='long':
                         active_stop = vwap_lo.iloc[-1] - mult*atr_now
@@ -1209,12 +1224,11 @@ def run_bot_vwap_only():
                         sl_confirm = (current_price > active_stop) and (close_prev <= stop_prev)
                         gap_exit = gap > atr_now and current_price > active_stop
 
-                hold_bars = len(df) - int(entry_bar or 0)
-                if hold_bars < s['MIN_HOLD_BARS'] and not gap_exit:
-                    sl_confirm = False
+                    hold_bars = len(df) - int(entry_bar or 0)
+                    if hold_bars < s['MIN_HOLD_BARS'] and not gap_exit:
+                        sl_confirm = False
+                    sl_hit = gap_exit or sl_confirm
 
-                sl_hit = gap_exit or sl_confirm
-                px_prec_pm = specs.get(current_instrument, {}).get('pxPrec', 4)
                 log(f"[PM] price={current_price:.{px_prec_pm}f} atr={atr_now:.4f} stop={active_stop:.{px_prec_pm}f} tp={tp_price:.{px_prec_pm}f}")
     
                 if tp_hit or sl_hit:
@@ -1254,23 +1268,25 @@ def run_bot_vwap_only():
                     if pnl_net>=0: win += 1
                     else: loss += 1
                     if s['PROGRESSION_ENABLED']:
+                        L_before = streak_before
                         if pnl_net > 0:
-                            streak_after = 0
+                            L_after = 0
                         elif pnl_net < 0:
-                            streak_after = min(streak_before + 1, s['MAX_PROGRESSION_STEPS'])
+                            L_after = min(L_before + 1, s['MAX_PROGRESSION_STEPS'])
                         else:
-                            streak_after = streak_before
-                        set_streak(state_file, prog, current_instrument, streak_after)
+                            L_after = L_before
+                        set_streak(state_file, prog, current_instrument, L_after)
                     else:
-                        streak_after = 0
+                        L_before = 0
+                        L_after = 0
                     hour_trades += 1; hour_profit += pnl_net
                     if pnl_net>=0: hour_wins += 1
                     else: hour_losses += 1
-    
+
                     exit_time = now_utc().isoformat()
                     hold_sec = int((now_utc() - datetime.fromisoformat(entry_time)).total_seconds()) if entry_time else 0
                     r_realized = abs((exit_fill_px - entry_price) / initial_stop_dist) if initial_stop_dist>0 else 0.0
-                    reason = "TP" if tp_hit else ("SL-gap" if gap_exit else "SL-confirm")
+                    reason = "TP" if tp_hit else ("SL-gap" if ('gap_exit' in locals() and gap_exit) else "SL-confirm")
     
                     rec = {
                         'timestamp_entry': entry_time,
@@ -1301,19 +1317,19 @@ def run_bot_vwap_only():
                         'sl_price': active_stop,
                         'target_profit_usdt': target_profit_usdt,
                         'target_loss_usdt': target_loss_usdt,
-                        'streak_before': streak_before,
-                        'streak_after': streak_after,
+                        'streak_before': L_before,
+                        'streak_after': L_after,
                     }
                     append_trade_record(history_file, rec)
     
                     if s['PROGRESSION_ENABLED']:
-                        hit = 'TP' if tp_hit else ('SL-gap' if gap_exit else 'SL')
+                        hit = 'TP' if tp_hit else ('SL-gap' if ('gap_exit' in locals() and gap_exit) else 'SL')
                         send_telegram(
                             s,
                             f"[EXIT] {current_instrument} {hit} {entry_dir}\n"
-                        f"in={entry_price:.{px_prec_pm}f} out={exit_fill_px:.{px_prec_pm}f} qty={qty_close}\n"
+                            f"in={entry_price:.{px_prec_pm}f} out={exit_fill_px:.{px_prec_pm}f} qty={qty_close}\n"
                             f"PnL_net={pnl_net:.2f} USDT | fees={fees:.2f}\n"
-                            f"L(before close)={streak_before} -> L(after close)={streak_after}"
+                            f"L(before close)={L_before} -> L(after close)={L_after}"
                         )
                     else:
                         send_telegram(

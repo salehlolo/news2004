@@ -26,6 +26,8 @@ import pandas as pd
 import numpy as np
 import math
 
+leverage_set = set()
+
 def log(message: str) -> None:
     print(message, flush=True)
 
@@ -194,6 +196,11 @@ def load_settings() -> Dict[str, any]:
     if s["PROGRESSION_ENABLED"]:
         s["PARTIAL_TP_ENABLED"] = False
 
+    s["DISABLE_SHRINK_ON_51008"] = _b("DISABLE_SHRINK_ON_51008", True)
+    s["SIZE_REDUCTION_FACTOR"] = _f("SIZE_REDUCTION_FACTOR", 0.80)
+    s["FEE_BUFFER_MULT"] = _f("FEE_BUFFER_MULT", 0.0)
+    s["POS_MODE"] = os.getenv("POS_MODE", "net")
+
     # Guards (price/margin)
     s["STRICT_PRICE_GUARD"] = _b("STRICT_PRICE_GUARD", True)
     s["PRICE_SPIKE_GUARD"] = _b("PRICE_SPIKE_GUARD", True)
@@ -267,6 +274,24 @@ def get_account_balance(settings: Dict[str, any], currency: str='USDT') -> float
         if d.get("ccy")==currency:
             total += float(d.get("availBal",0))
     return total
+
+def get_leverage_info(settings, inst_id: str, mgn_mode: str):
+    return okx_request(settings, "GET", "/api/v5/account/leverage-info",
+                       params={"instId": inst_id, "mgnMode": mgn_mode}, private=True)
+
+def set_leverage(settings, inst_id: str, mgn_mode: str, lever: int, pos_mode: str):
+    # in hedge mode need to set both long/short sides
+    if pos_mode == "long_short":
+        for side in ("long", "short"):
+            body = {"instId": inst_id, "mgnMode": mgn_mode, "lever": str(lever), "posSide": side}
+            r = okx_request(settings, "POST", "/api/v5/account/set-leverage", body=body, private=True)
+            if r.get("code") != "0":
+                raise RuntimeError(f"set-leverage {side} failed: {r}")
+        return
+    body = {"instId": inst_id, "mgnMode": mgn_mode, "lever": str(lever)}
+    r = okx_request(settings, "POST", "/api/v5/account/set-leverage", body=body, private=True)
+    if r.get("code") != "0":
+        raise RuntimeError(f"set-leverage failed: {r}")
 
 def get_last_price(settings: Dict[str, any], inst_id: str) -> float:
     r = okx_request(settings, "GET", "/api/v5/market/ticker", params={'instId': inst_id})
@@ -997,9 +1022,21 @@ def run_bot_vwap_only():
                             log(f"[FILTER] {inst} reject: price_spike_guard")
                             continue
 
+                    # --- Enforce leverage per-instrument once ---
+                    lev_eff = float(s["LEVERAGE"])
+                    try:
+                        if inst not in leverage_set:
+                            set_leverage(s, inst, s["TD_MODE"], int(s["LEVERAGE"]), s.get("POS_MODE","net"))
+                            leverage_set.add(inst)
+                        info = get_leverage_info(s, inst, s["TD_MODE"])
+                        lev_eff = float(info["data"][0]["lever"])
+                        log(f"[LEV] {inst} effective_leverage={lev_eff}")
+                    except Exception as e:
+                        log(f"[LEV_WARN] {inst} leverage set/check failed: {e}")
+
                     # Position sizing by fixed margin with precheck
-                    notional_target = margin_per_trade * s["LEVERAGE"]
-                    contracts_raw = notional_target / (price * ct)
+                    notional_target = margin_per_trade * lev_eff
+                    contracts_raw   = notional_target / (price * ct)
                     qty = math.floor(contracts_raw / lot) * lot
                     if qty < min_sz:
                         if s["AUTO_ADJUST_MARGIN"]:
@@ -1007,25 +1044,25 @@ def run_bot_vwap_only():
                         else:
                             continue
                     notional = qty * price * ct
-                    fee_buffer = notional * s["FEE_RATE"] * 2
-                    required_margin = notional / s["LEVERAGE"] + fee_buffer
+                    fee_buffer     = notional * s["FEE_RATE"] * s.get("FEE_BUFFER_MULT", 0.0)
+                    required_margin= notional / lev_eff + fee_buffer
                     log(f"[SIZING] price={price:.{px_prec}f} ctVal={ct} lotSz={lot} minSz={min_sz} contracts_raw={contracts_raw:.4f} qty_final={qty}")
-                    safety = float(s.get("MARGIN_SAFETY_FRACTION", 0.95))
-                    max_notional = bal * s["LEVERAGE"] * safety
+                    safety       = float(s.get("MARGIN_SAFETY_FRACTION", 0.95))
+                    max_notional = bal * lev_eff * safety
                     if notional > max_notional:
                         qty_cap = math.floor((max_notional / (price * ct)) / lot) * lot
                         if qty_cap < min_sz:
                             log(f"[FILTER] {inst} reject: qty_below_min after margin cap")
                             continue
-                        qty = qty_cap
+                        qty      = qty_cap
                         notional = qty * price * ct
-                        fee_buffer = notional * s["FEE_RATE"] * 2
-                        required_margin = notional / s["LEVERAGE"] + fee_buffer
+                        fee_buffer      = notional * s["FEE_RATE"] * s.get("FEE_BUFFER_MULT", 0.0)
+                        required_margin = notional / lev_eff + fee_buffer
                     if bal < required_margin:
-                        log(f"[PRECHECK_FAIL] avail={bal:.2f} required={required_margin:.2f} notional={notional:.2f} qty={qty} leverage={s['LEVERAGE']}")
+                        log(f"[PRECHECK_FAIL] avail={bal:.2f} required={required_margin:.2f} notional={notional:.2f} qty={qty} lev_eff={lev_eff}")
                         continue
                     size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
-                    margin = notional / s["LEVERAGE"]
+                    margin = notional / lev_eff
 
                     entry_dir = 'long' if direction=='buy' else 'short'
                     basis = s.get('PROGRESSION_BASIS', 'margin')
@@ -1090,18 +1127,30 @@ def run_bot_vwap_only():
                             break
                         except Exception as ex:
                             msg = str(ex)
-                            if ('51008' in msg or '51202' in msg) and qty > min_sz:
-                                new_qty = math.floor(max(min_sz, qty * 0.8) / lot) * lot
+                            if '51202' in msg and qty > min_sz:
+                                new_qty = math.floor(max(min_sz, qty * s.get("SIZE_REDUCTION_FACTOR",0.80)) / lot) * lot
                                 if new_qty == qty:
                                     new_qty = max(min_sz, qty - lot)
                                 qty = new_qty
                                 size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
-                                log(f"[RETRY] {inst} reducing qty to {size_str} due to {('51008' if '51008' in msg else '51202')}")
+                                log(f"[RETRY] {inst} reducing qty to {size_str} due to 51202")
                                 attempts += 1
                                 continue
-                            else:
-                                log(f"[ORDER_ERROR] {ex}")
-                                raise
+                            if '51008' in msg:
+                                if s.get("DISABLE_SHRINK_ON_51008", True):
+                                    log("[RETRY] 51008 with fixed sizing policy -> abort this symbol this cycle")
+                                    response = None
+                                    break
+                                new_qty = math.floor(max(min_sz, qty * s.get("SIZE_REDUCTION_FACTOR",0.80)) / lot) * lot
+                                if new_qty == qty:
+                                    new_qty = max(min_sz, qty - lot)
+                                qty = new_qty
+                                size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
+                                log(f"[RETRY] {inst} reducing qty to {size_str} due to 51008")
+                                attempts += 1
+                                continue
+                            log(f"[ORDER_ERROR] {ex}")
+                            break
                     if response is None:
                         continue
 
@@ -1134,7 +1183,7 @@ def run_bot_vwap_only():
                     entry_ct_val = ct
                     entry_time = now_utc().isoformat()
                     notional = exec_qty * entry_price * ct
-                    margin = notional / s['LEVERAGE']
+                    margin = notional / lev_eff
 
                     if s['PROGRESSION_ENABLED']:
                         basis = s.get('PROGRESSION_BASIS', 'margin')
@@ -1167,7 +1216,7 @@ def run_bot_vwap_only():
                             f" دخول صفقة {dir_txt} على <b>{inst}</b>\n"
                             f"TF: {tf_main}\n"
                         f"الكمية: {exec_qty} | سعر الدخول (fill): {entry_price:.{px_prec}f}\n"
-                        f"الهامش: {margin:.2f} | النوتيونال: {notional:.2f} | الرافعة: {s['LEVERAGE']}x\n"
+                        f"الهامش: {margin:.2f} | النوتيونال: {notional:.2f} | الرافعة: {lev_eff:.0f}x\n"
                         f"SL (مبدئي/فعّال): {active_stop:.{px_prec}f} | TP: {tp_price:.{px_prec}f}\n"
                             f"ordId: {entry_ordId}"
                         )
@@ -1321,7 +1370,7 @@ def run_bot_vwap_only():
                         'hold_time_sec': hold_sec,
                         'notional_entry': entry_price * qty_close * (entry_ct_val or 1.0),
                         'notional_exit': exit_fill_px * qty_close * (entry_ct_val or 1.0),
-                        'leverage': s['LEVERAGE'],
+                        'leverage': lev_eff,
                         'tp_on_margin_pct': tp_pct,
                         'sl_on_margin_pct': sl_pct,
                         'tp_price': tp_price,

@@ -119,6 +119,7 @@ def load_settings() -> Dict[str, any]:
     s["REWARD_RISK_RATIO"] = _f("REWARD_RISK_RATIO", 5.0)
     s["MARGIN_PER_TRADE_USDT"] = _f("MARGIN_PER_TRADE_USDT", 90.0)
     s["LEVERAGE"] = _i("LEVERAGE", 10)
+    s["TD_MODE"] = os.getenv("TD_MODE", "cross").lower()
     s["AUTO_ADJUST_MARGIN"] = _b("AUTO_ADJUST_MARGIN", True)
     s["MIN_MARGIN_PER_TRADE_USDT"] = _f("MIN_MARGIN_PER_TRADE_USDT", 15.0)
     s["ENVIRONMENT"] = os.getenv("ENVIRONMENT","demo")
@@ -1078,7 +1079,7 @@ def run_bot_vwap_only():
 
                     side = 'buy' if direction=='buy' else 'sell'
                     try:
-                        response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=s['LEVERAGE'], td_mode='cross', ord_type='market')
+                        response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=s['LEVERAGE'], td_mode=s['TD_MODE'], ord_type='market')
                     except Exception as ex:
                         msg = str(ex)
                         if ('51008' in msg or 'Insufficient USDT margin' in msg) and qty > min_sz:
@@ -1086,7 +1087,7 @@ def run_bot_vwap_only():
                             size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
                             log(f"[RETRY] {inst} reducing qty to {size_str} due to 51008")
                             try:
-                                response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=s['LEVERAGE'], td_mode='cross', ord_type='market')
+                                response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=s['LEVERAGE'], td_mode=s['TD_MODE'], ord_type='market')
                             except Exception as ex2:
                                 log(f"[ORDER_ERROR] {ex2}")
                                 continue
@@ -1237,7 +1238,7 @@ def run_bot_vwap_only():
                     prec = specs.get(current_instrument, {}).get('szPrec', 0)
                     size_close = f"{qty_close:.{prec}f}".rstrip('0').rstrip('.')
                     try:
-                        response = place_order(s, side=closing_side, size=size_close, inst_id=current_instrument, leverage=s['LEVERAGE'], td_mode='cross', ord_type='market')
+                        response = place_order(s, side=closing_side, size=size_close, inst_id=current_instrument, leverage=s['LEVERAGE'], td_mode=s['TD_MODE'], ord_type='market')
                     except Exception as ex:
                         log(f"[ORDER_CLOSE_ERROR] {ex}")
                         time.sleep(60); continue

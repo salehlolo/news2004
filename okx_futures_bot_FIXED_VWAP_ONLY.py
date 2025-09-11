@@ -1078,22 +1078,32 @@ def run_bot_vwap_only():
                         target_profit_usdt = target_loss_usdt = 0.0
 
                     side = 'buy' if direction=='buy' else 'sell'
-                    try:
-                        response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=s['LEVERAGE'], td_mode=s['TD_MODE'], ord_type='market')
-                    except Exception as ex:
-                        msg = str(ex)
-                        if ('51008' in msg or 'Insufficient USDT margin' in msg) and qty > min_sz:
-                            qty = max(min_sz, qty - lot)
-                            size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
-                            log(f"[RETRY] {inst} reducing qty to {size_str} due to 51008")
-                            try:
-                                response = place_order(s, side=side, size=size_str, inst_id=inst, leverage=s['LEVERAGE'], td_mode=s['TD_MODE'], ord_type='market')
-                            except Exception as ex2:
-                                log(f"[ORDER_ERROR] {ex2}")
+                    attempts = 0
+                    max_attempts = 8
+                    response = None
+                    while attempts < max_attempts:
+                        try:
+                            response = place_order(
+                                s, side=side, size=size_str, inst_id=inst,
+                                leverage=s['LEVERAGE'], td_mode=s['TD_MODE'], ord_type='market'
+                            )
+                            break
+                        except Exception as ex:
+                            msg = str(ex)
+                            if ('51008' in msg or '51202' in msg) and qty > min_sz:
+                                new_qty = math.floor(max(min_sz, qty * 0.8) / lot) * lot
+                                if new_qty == qty:
+                                    new_qty = max(min_sz, qty - lot)
+                                qty = new_qty
+                                size_str = f"{qty:.{prec}f}".rstrip('0').rstrip('.')
+                                log(f"[RETRY] {inst} reducing qty to {size_str} due to {('51008' if '51008' in msg else '51202')}")
+                                attempts += 1
                                 continue
-                        else:
-                            log(f"[ORDER_ERROR] {ex}")
-                            continue
+                            else:
+                                log(f"[ORDER_ERROR] {ex}")
+                                raise
+                    if response is None:
+                        continue
 
                     try:
                         od = response.get('data', [])[0]
